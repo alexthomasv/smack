@@ -359,50 +359,98 @@ const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
 
   if (CI.getNumArgOperands() == 1) {
     name = indexedName(Naming::VALUE_PROC, {type(V->getType())});
-    if (dyn_cast<const Argument>(V)) {
-      attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*V))}));
+    llvm::errs() << "[DEBUG] Analyzing: " << *V << "\n";
 
-    } else if (auto LI = dyn_cast<const LoadInst>(V)) {
-      auto GEP = dyn_cast<const GetElementPtrInst>(LI->getPointerOperand());
-      assert(GEP && "Expected GEP argument to load instruction.");
-      auto A = dyn_cast<const Argument>(GEP->getPointerOperand());
-      assert(A && "Expected function argument to GEP instruction.");
-      auto T = GEP->getResultElementType();
-      const unsigned bits = this->getSize(T);
-      const unsigned bytes = bits / 8;
-      const unsigned R = regions->idx(GEP);
-      bool bytewise = regions->get(R).bytewiseAccess();
-      attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*A))}));
-      attrs.push_back(Attr::attr(
-          "field", {
-                       Expr::lit(Naming::LOAD + "." +
-                                 (bytewise ? "bytes." : "") + intType(bits)),
-                       Expr::id(memPath(R)),
-                       ptrArith(GEP),
-                       Expr::lit(bytes),
-                   }));
-
-    } else {
-      llvm_unreachable("Unexpected argument type.");
+    // 1. Strip BitCasts
+    const Value *ResolvedV = V;
+    while (auto BC = dyn_cast<const BitCastInst>(ResolvedV)) {
+        ResolvedV = BC->getOperand(0);
     }
 
+    if (dyn_cast<const Argument>(ResolvedV)) {
+      attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*ResolvedV))}));
+
+    } else if (auto LI = dyn_cast<const LoadInst>(ResolvedV)) {
+      
+      // --- Handle Local Variables (Alloca) ---
+      if (auto AI = dyn_cast<const AllocaInst>(LI->getPointerOperand())) {
+          auto T = AI->getAllocatedType();
+          const unsigned bits = this->getSize(T);
+          const unsigned bytes = bits / 8;
+          const unsigned R = regions->idx(AI);
+          bool bytewise = regions->get(R).bytewiseAccess();
+          
+          attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*AI))}));
+          attrs.push_back(Attr::attr(
+              "field", {
+                           Expr::lit(Naming::LOAD + "." +
+                                     (bytewise ? "bytes." : "") + intType(bits)),
+                           Expr::id(memPath(R)),
+                           expr(AI),
+                           Expr::lit(bytes),
+                       }));
+      } 
+      // --- Handle GEPs (Strict Legacy Logic) ---
+      else {
+          auto GEP = dyn_cast<const GetElementPtrInst>(LI->getPointerOperand());
+          // If this assertion fails, it means you have a Load that isn't from an Alloca or GEP.
+          // (e.g., a direct pointer load). But per your request, we crash/assert here.
+          assert(GEP && "Expected GEP argument to load instruction.");
+          
+          auto A = dyn_cast<const Argument>(GEP->getPointerOperand());
+          assert(A && "Expected function argument to GEP instruction.");
+          
+          auto T = GEP->getResultElementType();
+          const unsigned bits = this->getSize(T);
+          const unsigned bytes = bits / 8;
+          const unsigned R = regions->idx(GEP);
+          bool bytewise = regions->get(R).bytewiseAccess();
+          attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*A))}));
+          attrs.push_back(Attr::attr(
+              "field", {
+                           Expr::lit(Naming::LOAD + "." +
+                                     (bytewise ? "bytes." : "") + intType(bits)),
+                           Expr::id(memPath(R)),
+                           ptrArith(GEP),
+                           Expr::lit(bytes),
+                       }));
+      }
+
+    } 
+    // --- THIS IS THE FIX ---
+    // You MUST handle generic instructions (add, sub, etc.) or SMACK will crash 
+    // when you verify math results like 'k'.
+    else if (auto Inst = dyn_cast<const Instruction>(ResolvedV)) {
+        attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*Inst))}));
+    }
+    
+    else {
+      llvm::errs() << "Unexpected argument type: " << *ResolvedV << "\n";
+      llvm_unreachable("Unexpected argument type.");
+    }
+    llvm::errs().flush();
   } else {
     name = Naming::VALUE_PROC + "s";
     const Argument *A;
     Type *T;
     const Expr *addr;
 
+    llvm::errs() << "CI: " << CI << "\n";
+    llvm::errs() << "V: " << *V << "\n";
+
     if ((A = dyn_cast<const Argument>(V))) {
       auto PT = dyn_cast<const PointerType>(A->getType());
       assert(PT && "Expected pointer argument.");
       T = PT->getElementType();
       addr = expr(A);
+      attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*A))}));
 
     } else if (auto GEP = dyn_cast<const GetElementPtrInst>(V)) {
       A = dyn_cast<const Argument>(GEP->getPointerOperand());
       assert(A && "Expected function argument to GEP instruction.");
       T = GEP->getResultElementType();
       addr = ptrArith(GEP);
+      attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*A))}));
 
     } else if (auto LI = dyn_cast<const LoadInst>(V)) {
       auto GEP = dyn_cast<const GetElementPtrInst>(LI->getPointerOperand());
@@ -413,9 +461,17 @@ const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
       auto PT = dyn_cast<PointerType>(V->getType());
       assert(PT && "Expected pointer type result of load instruction.");
       T = PT->getElementType();
-      addr = ptrArith(GEP);
+      addr = ptrArith(GEP);      
+      attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*A))}));
+    } else if (auto AI = dyn_cast<const AllocaInst>(V)) {
+      auto *AT = dyn_cast<llvm::ArrayType>(AI->getAllocatedType());
+      assert(AT && "expected an array type on the stack");
+      T = AT->getElementType();
+      addr = expr(AI);
 
+      attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*AI))}));
     } else {
+      llvm::errs() << "Unexpected argument type.\n";
       llvm_unreachable("Unexpected argument type.");
     }
 
@@ -429,7 +485,6 @@ const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
     const unsigned R = regions->idx(V, length);
     bool bytewise = regions->get(R).bytewiseAccess();
     args.push_back(expr(CI.getArgOperand(1)));
-    attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*A))}));
     attrs.push_back(Attr::attr(
         "array",
         {Expr::lit(Naming::LOAD + "." + (bytewise ? "bytes." : "") +

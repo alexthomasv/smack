@@ -206,6 +206,7 @@ public:
 
   bool isContractExpr(const llvm::Value *V) const;
   bool isContractExpr(const std::string S) const;
+  Regions* getRegions() const { return regions; }
 
   void addAuxiliaryDeclaration(Decl *D);
   std::list<Decl *> auxiliaryDeclarations();

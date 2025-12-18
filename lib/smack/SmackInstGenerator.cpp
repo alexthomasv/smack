@@ -14,6 +14,7 @@
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/Support/GraphWriter.h"
+#include "smack/Regions.h"
 #include <sstream>
 
 #include "llvm/Support/raw_ostream.h"
@@ -670,7 +671,94 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     proc->getModifies().push_back(rep->code(ci));
 
   } else if (name.find(Naming::CODE_PROC) != StringRef::npos) {
-    emit(Stmt::code(rep->code(ci)));
+    // 1. Generate the final Boogie string (substituting '@' with variable names)
+    std::string boogieCode = rep->code(ci);
+
+    // --- START DEBUGGING BLOCK ---
+    // std::cout << "\n========== [DEBUG SMACK_CODE] ==========" << std::endl;
+    // std::cout << "Location: Block " 
+    //           << (ci.getParent() ? ci.getParent()->getName().str() : "NULL") << std::endl;
+    // std::cout << "Generated Boogie Code: " << boogieCode << std::endl;
+
+
+    for (unsigned i = 0; i < ci.getNumArgOperands(); ++i) {
+      llvm::Value* arg = ci.getArgOperand(i);
+
+      // We only care about pointer arguments
+      if (!arg || !arg->getType()->isPointerTy()) continue;
+
+      // 3. Prepare the search token
+      //    rep->expr(arg) converts the LLVM value to its Boogie name (e.g., "$p334")
+      // Print the expression object to a string stream
+      std::stringstream ss;
+      rep->expr(arg)->print(ss);
+      std::string boogieVar = ss.str();
+      // std::cout << "Boogie Var: " << boogieVar << std::endl;
+      std::string searchToken = "MEM(" + boogieVar + ")";
+
+
+      // 4. Check if the generated Boogie string contains "MEM($p334)"
+      if (boogieCode.find(searchToken) != std::string::npos) {
+          
+          // 5. Query the Regions pass for the index
+          //    This traverses DSA and returns the integer ID for this pointer's partition
+          unsigned regionId = rep->getRegions()->idx(arg);
+          
+          // 6. Construct the map name (Standard SMACK naming is $M.<ID>)
+          std::string mapName = "$M." + std::to_string(regionId);
+
+          // 7. Replace ALL occurrences of the token with the map name
+          size_t pos = 0;
+          while ((pos = boogieCode.find(searchToken, pos)) != std::string::npos) {
+              boogieCode.replace(pos, searchToken.length(), mapName);
+              pos += mapName.length();
+          }
+
+          // Optional: Debug print to confirm it worked
+          // std::cout << "[SMACK] Resolved " << searchToken << " -> " << mapName << std::endl;
+      }
+  }
+    
+    // Optional: Print raw arguments if needed for deep debugging
+    /*
+    if (ci.getNumArgOperands() > 0) {
+        std::cout << "Raw Args:" << std::endl;
+        for (unsigned i = 0; i < ci.getNumArgOperands(); ++i) {
+             Value *arg = ci.getArgOperand(i);
+             std::cout << "  " << (arg ? arg->getName().str() : "null") << std::endl;
+        }
+    }
+    */
+    // std::cout << "========================================\n" << std::endl;
+    // --- END DEBUGGING BLOCK ---
+
+
+    // 2. Identify the Loop Context
+    auto L = loops[ci.getParent()];
+
+    // 3. Hoist Logic
+    // Condition: Must be inside a loop AND contain the magic substring "loop_invariant"
+    if (L && boogieCode.find("loop_invariant") != std::string::npos) {
+        
+        auto H = L->getHeader();
+        
+        // Safety checks: Ensure header exists and has been mapped to Boogie
+        if (H && blockMap.count(H)) {
+            // std::cout << "[SMACK] HOISTING code to Loop Header: " << H->getName().str() << std::endl;
+            
+            // Push the raw code statement to the VERY FRONT of the loop header block
+            blockMap[H]->getStatements().push_front(Stmt::code(boogieCode));
+            
+        } else {
+            // Fallback: If header mapping is missing, emit normally and warn
+            // std::cout << "[SMACK] WARNING: Could not find mapped header for hoisting. Emitting inline." << std::endl;
+            emit(Stmt::code(boogieCode));
+        }
+
+    } else {
+        // Standard Behavior: Emit the code exactly where the call is (in the body)
+        emit(Stmt::code(boogieCode));
+    }
 
   } else if (name.find(Naming::DECL_PROC) != StringRef::npos) {
     std::string code = rep->code(ci);
