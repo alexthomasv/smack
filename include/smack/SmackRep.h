@@ -4,6 +4,7 @@
 #ifndef SMACKREP_H
 #define SMACKREP_H
 
+#include "llvm/ADT/SmallString.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/InstVisitor.h"
@@ -11,6 +12,7 @@
 #include "llvm/Support/GraphWriter.h"
 #include "llvm/Support/Regex.h"
 #include <list>
+#include <map>
 #include <sstream>
 
 namespace smack {
@@ -114,6 +116,7 @@ private:
   unsigned getIntSize(const llvm::Value *v);
   unsigned getIntSize(const llvm::Type *t);
   unsigned getSize(llvm::Type *t);
+  const llvm::Type *pointeeType(const llvm::Value *p);
 
   std::string pointerType();
   std::string intType(unsigned width);
@@ -185,8 +188,10 @@ public:
   const Stmt *memcpy(const llvm::MemCpyInst &msi);
   const Stmt *memset(const llvm::MemSetInst &msi);
   const Expr *load(const llvm::Value *P);
+  const Expr *load(const llvm::Value *P, const llvm::Type *T);
   const Stmt *store(const llvm::Value *P, const llvm::Value *V);
   const Stmt *store(const llvm::Value *P, const Expr *V);
+  const Stmt *store(const llvm::Value *P, const llvm::Type *T, const Expr *V);
 
   const Stmt *valueAnnotation(const llvm::CallInst &CI);
   const Stmt *returnValueAnnotation(const llvm::CallInst &CI);
@@ -201,6 +206,7 @@ public:
   std::string memType(unsigned region);
   std::string memPath(unsigned region);
   std::string memPath(const llvm::Value *v);
+  std::string memPath(const llvm::Value *v, const llvm::Type *T);
 
   std::list<std::pair<std::string, std::string>> memoryMaps();
 

@@ -130,6 +130,31 @@ std::string SmackInstGenerator::getSourceLine(const std::string &filename,
   return "";
 }
 
+unsigned SmackInstGenerator::instructionIndex(const llvm::Instruction &I) const {
+  unsigned index = 0;
+  if (!I.getParent())
+    return index;
+
+  for (auto &Other : *I.getParent()) {
+    if (&Other == &I)
+      return index;
+    if (!llvm::isa<llvm::DbgInfoIntrinsic>(Other))
+      index++;
+  }
+  return index;
+}
+
+std::string SmackInstGenerator::llvmInstructionId(
+    const llvm::Instruction &I) const {
+  std::stringstream id;
+  id << (I.getFunction() ? naming->get(*I.getFunction()) : "<nofunc>");
+  id << ":";
+  id << (I.getParent() ? naming->get(*I.getParent()) : "<nobb>");
+  id << ":";
+  id << instructionIndex(I);
+  return id.str();
+}
+
 void SmackInstGenerator::annotate(llvm::Instruction &I, Block *B) {
 
   // do not generate sourceloc from calls to llvm.debug since
@@ -154,6 +179,17 @@ void SmackInstGenerator::annotate(llvm::Instruction &I, Block *B) {
     if (!srcLine.empty()) {
       B->addStmt(Stmt::annot(Attr::attr("c_line", srcLine)));
     }
+  }
+
+  if (SmackOptions::ProvenanceSymbols) {
+    std::string func = I.getFunction() ? naming->get(*I.getFunction()) : "";
+    std::string bb = I.getParent() ? naming->get(*I.getParent()) : "";
+    std::list<const Attr *> attrs;
+    attrs.push_back(Attr::attr("llvm.func", func));
+    attrs.push_back(Attr::attr("llvm.bb", bb));
+    attrs.push_back(Attr::attr("llvm.inst", llvmInstructionId(I)));
+    attrs.push_back(Attr::attr("llvm.op", I.getOpcodeName()));
+    B->addStmt(Stmt::annot(attrs));
   }
 
   // https://stackoverflow.com/questions/22138947/reading-metadata-from-instruction
@@ -198,7 +234,7 @@ void SmackInstGenerator::visitBasicBlock(llvm::BasicBlock &bb) {
 
   auto *F = bb.getParent();
   if (&bb == &F->getEntryBlock()) {
-    for (auto &I : bb.getInstList()) {
+    for (auto &I : bb) {
       if (llvm::isa<llvm::DbgInfoIntrinsic>(I))
         continue;
       if (I.getDebugLoc()) {
@@ -586,18 +622,18 @@ void SmackInstGenerator::visitAllocaInst(llvm::AllocaInst &ai) {
 void SmackInstGenerator::visitLoadInst(llvm::LoadInst &li) {
   processInstruction(li);
   auto P = li.getPointerOperand();
-  auto T = dyn_cast<PointerType>(P->getType());
-  assert(T && "expected pointer type");
+  assert(P->getType()->isPointerTy() && "expected pointer type");
 
   // TODO what happens with aggregate types?
   // assert (!li.getType()->isAggregateType() && "Unexpected load value.");
 
   const Expr *E;
-  if (isa<FixedVectorType>(T->getElementType())) {
-    auto D = VectorOperations(rep).load(P);
-    E = Expr::fn(D->getName(), {Expr::id(rep->memPath(P)), rep->expr(P)});
+  if (isa<FixedVectorType>(li.getType())) {
+    auto D = VectorOperations(rep).load(P, li.getType());
+    E = Expr::fn(D->getName(), {Expr::id(rep->memPath(P, li.getType())),
+                                rep->expr(P)});
   } else {
-    E = rep->load(P);
+    E = rep->load(P, li.getType());
   }
 
   emit(Stmt::assign(rep->expr(&li), E));
@@ -618,8 +654,8 @@ void SmackInstGenerator::visitStoreInst(llvm::StoreInst &si) {
   assert(!V->getType()->isAggregateType() && "Unexpected store value.");
 
   if (isa<FixedVectorType>(V->getType())) {
-    auto D = VectorOperations(rep).store(P);
-    auto M = Expr::id(rep->memPath(P));
+    auto D = VectorOperations(rep).store(P, V->getType());
+    auto M = Expr::id(rep->memPath(P, V->getType()));
     auto E = Expr::fn(D->getName(), {M, rep->expr(P), rep->expr(V)});
     emit(Stmt::assign(M, E));
   } else {
@@ -632,12 +668,9 @@ void SmackInstGenerator::visitStoreInst(llvm::StoreInst &si) {
   if (SmackOptions::SourceLocSymbols) {
     if (const llvm::GlobalVariable *G =
             llvm::dyn_cast<const llvm::GlobalVariable>(P)) {
-      if (const llvm::PointerType *t =
-              llvm::dyn_cast<const llvm::PointerType>(G->getType())) {
-        if (!t->getElementType()->isPointerTy() && G->hasName()) {
-          emit(recordProcedureCall(V,
-                                   {Attr::attr("cexpr", G->getName().str())}));
-        }
+      if (!G->getValueType()->isPointerTy() && G->hasName()) {
+        emit(recordProcedureCall(V,
+                                 {Attr::attr("cexpr", G->getName().str())}));
       }
     }
   }
@@ -654,11 +687,11 @@ void SmackInstGenerator::visitStoreInst(llvm::StoreInst &si) {
 void SmackInstGenerator::visitAtomicCmpXchgInst(llvm::AtomicCmpXchgInst &i) {
   processInstruction(i);
   const Expr *res = rep->expr(&i);
-  const Expr *mem = rep->load(i.getOperand(0));
+  const Expr *mem = rep->load(i.getOperand(0), i.getCompareOperand()->getType());
   const Expr *cmp = rep->expr(i.getOperand(1));
   const Expr *swp = rep->expr(i.getOperand(2));
   emit(Stmt::assign(res, mem));
-  emit(rep->store(i.getOperand(0),
+  emit(rep->store(i.getOperand(0), i.getCompareOperand()->getType(),
                   Expr::ifThenElse(Expr::eq(mem, cmp), swp, mem)));
 }
 
@@ -666,11 +699,11 @@ void SmackInstGenerator::visitAtomicRMWInst(llvm::AtomicRMWInst &i) {
   using llvm::AtomicRMWInst;
   processInstruction(i);
   const Expr *res = rep->expr(&i);
-  const Expr *mem = rep->load(i.getPointerOperand());
+  const Expr *mem = rep->load(i.getPointerOperand(), i.getValOperand()->getType());
   const Expr *val = rep->expr(i.getValOperand());
   auto valT = rep->type(i.getValOperand()->getType());
   emit(Stmt::assign(res, mem));
-  emit(rep->store(i.getPointerOperand(),
+  emit(rep->store(i.getPointerOperand(), i.getValOperand()->getType(),
                   i.getOperation() == AtomicRMWInst::Xchg
                       ? val
                       : Expr::fn(indexedName(Naming::ATOMICRMWINST_TABLE.at(
@@ -772,7 +805,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     // Skip this assertion if we shouldn't check in the parent function
     return;
 
-  } else if (name == "__VERIFIER_assume" && ci.getNumArgOperands() == 1) {
+  } else if (name == "__VERIFIER_assume" && ci.arg_size() == 1) {
     // Emit assume directly in the caller, without inline procedure indirection.
     // This keeps the assume's variable in the caller's scope so the
     // backslice can trace constraints back to the original parameters.
@@ -783,7 +816,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
   } else if (name == "__VERIFIER_assert" &&
              SmackOptions::shouldCheckFunction(
                  ci.getParent()->getParent()->getName()) &&
-             ci.getNumArgOperands() == 1) {
+             ci.arg_size() == 1) {
     // Emit assert directly in the caller, same as assume but for asserts.
     const Expr *arg = rep->expr(ci.getArgOperand(0));
     emit(Stmt::assert_(Expr::neq(arg, Expr::id("$0"))));
@@ -801,7 +834,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
   } else if (name.find(Naming::CODE_PROC) != StringRef::npos) {
     std::string boogieCode = rep->code(ci);
 
-    for (unsigned i = 0; i < ci.getNumArgOperands(); ++i) {
+    for (unsigned i = 0; i < ci.arg_size(); ++i) {
       llvm::Value *arg = ci.getArgOperand(i);
 
       if (!arg || !arg->getType()->isPointerTy())
@@ -952,7 +985,8 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
         " == 1;";
 
     } else {
-      llvm_unreachable(("Unknown SMACK invariant intrinsic: " + name).c_str());
+      llvm_unreachable(
+          ("Unknown SMACK invariant intrinsic: " + name.str()).c_str());
     }
 
     // Hoist to loop header (same logic as __SMACK_code)
@@ -993,7 +1027,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
 
     llvm_unreachable("universal quantifiers not implemented.");
 
-    // assert(ci.getNumArgOperands() == 2
+    // assert(ci.arg_size() == 2
     //     && "Expected contract expression argument to contract function.");
     // CallInst* cj = dyn_cast<CallInst>(ci.getArgOperand(1));
     // assert(cj && "Expected contract expression argument to contract
@@ -1006,7 +1040,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     // std::list<const Expr*> args;
     //
     // auto AX = F->getAttributes();
-    // for (unsigned i = 0; i < cj->getNumArgOperands(); i++) {
+    // for (unsigned i = 0; i < cj->arg_size(); i++) {
     //   std::string var = "";
     //   if (AX.hasAttribute(i+1, "contract-var"))
     //     var = AX.getAttribute(i+1, "contract-var").getValueAsString();
@@ -1025,7 +1059,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
              name == Naming::CONTRACT_ENSURES ||
              name == Naming::CONTRACT_INVARIANT) {
 
-    assert(ci.getNumArgOperands() == 1 &&
+    assert(ci.arg_size() == 1 &&
            "Expected contract expression argument to contract function.");
     CallInst *cj = dyn_cast<CallInst>(ci.getArgOperand(0));
     assert(cj && "Expected contract expression argument to contract function.");
@@ -1034,7 +1068,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
            "Expected contract expression argument to contract function.");
 
     std::list<const Expr *> args;
-    for (auto &V : cj->arg_operands())
+    for (auto &V : cj->args())
       args.push_back(rep->expr(V));
     for (auto m : rep->memoryMaps())
       args.push_back(Expr::id(m.first));
@@ -1053,16 +1087,16 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     }
 
     // } else if (name == "result") {
-    //   assert(ci.getNumArgOperands() == 0 && "Unexpected operands to
+    //   assert(ci.arg_size() == 0 && "Unexpected operands to
     //   result.");
     //   emit(Stmt::assign(rep->expr(&ci),Expr::id(Naming::RET_VAR)));
     //
     // } else if (name == "qvar") {
-    //   assert(ci.getNumArgOperands() == 1 && "Unexpected operands to qvar.");
+    //   assert(ci.arg_size() == 1 && "Unexpected operands to qvar.");
     //   emit(Stmt::assign(rep->expr(&ci),Expr::id(rep->getString(ci.getArgOperand(0)))));
     //
     // } else if (name == "old") {
-    //   assert(ci.getNumArgOperands() == 1 && "Unexpected operands to old.");
+    //   assert(ci.arg_size() == 1 && "Unexpected operands to old.");
     //   llvm::LoadInst* LI =
     //   llvm::dyn_cast<llvm::LoadInst>(ci.getArgOperand(0));
     //   assert(LI && "Expected value from Load.");
@@ -1070,7 +1104,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     //     Expr::fn("old",rep->load(LI->getPointerOperand())) ));
 
     // } else if (name == "forall") {
-    //   assert(ci.getNumArgOperands() == 2 && "Unexpected operands to
+    //   assert(ci.arg_size() == 2 && "Unexpected operands to
     //   forall.");
     //   Value* var = ci.getArgOperand(0);
     //   Value* arg = ci.getArgOperand(1);
@@ -1080,7 +1114,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     //     S->getBoogieExpression(naming,rep))));
     //
     // } else if (name == "exists") {
-    //   assert(ci.getNumArgOperands() == 2 && "Unexpected operands to
+    //   assert(ci.arg_size() == 2 && "Unexpected operands to
     //   forall.");
     //   Value* var = ci.getArgOperand(0);
     //   Value* arg = ci.getArgOperand(1);
@@ -1090,7 +1124,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     //     S->getBoogieExpression(naming,rep))));
     //
     // } else if (name == "invariant") {
-    //   assert(ci.getNumArgOperands() == 1 && "Unexpected operands to
+    //   assert(ci.arg_size() == 1 && "Unexpected operands to
     //   invariant.");
     //   Slice* S = getSlice(ci.getArgOperand(0));
     //   emit(Stmt::assert_(S->getBoogieExpression(naming,rep)));
@@ -1514,7 +1548,10 @@ void SmackInstGenerator::visitIntrinsicInst(llvm::IntrinsicInst &ii) {
   auto it = stmtMap.find(ii.getIntrinsicID());
   if (it != stmtMap.end())
     it->second(&ii);
-  else {
+  else if (ii.getIntrinsicID() ==
+           llvm::Intrinsic::experimental_noalias_scope_decl) {
+    // Ignore this function as we cannot handle arguments of metadata type.
+  } else {
     SmackWarnings::warnApproximate(ii.getCalledFunction()->getName().str(),
                                    currBlock, &ii);
     emit(rep->call(ii.getCalledFunction(), ii));

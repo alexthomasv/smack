@@ -6,6 +6,7 @@
 
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/InstVisitor.h"
+#include <map>
 #include <set>
 #include <unordered_set>
 
@@ -47,6 +48,8 @@ private:
   void processInstruction(llvm::Instruction &i);
   void nameInstruction(llvm::Instruction &i);
   void annotate(llvm::Instruction &i, Block *b);
+  unsigned instructionIndex(const llvm::Instruction &i) const;
+  std::string llvmInstructionId(const llvm::Instruction &i) const;
 
   const Stmt *recordProcedureCall(const llvm::Value *V,
                                   std::list<const Attr *> attrs);

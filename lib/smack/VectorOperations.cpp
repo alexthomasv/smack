@@ -55,7 +55,8 @@ const Expr *VectorOperations::constant(const ConstantDataVector *C) {
 const Expr *VectorOperations::constant(const ConstantAggregateZero *C) {
   auto T = C->getType();
   std::list<const Expr *> args;
-  for (unsigned i = 0; i < C->getNumElements(); i++)
+  auto elemCount = C->getElementCount().getFixedValue();
+  for (unsigned i = 0; i < elemCount; i++)
     args.push_back(rep->expr(C->getElementValue(i)));
   return Expr::fn(constructor(T), args);
 }
@@ -263,18 +264,16 @@ FuncDecl *VectorOperations::extract(Type *T, Type *IT) {
   return F;
 }
 
-FuncDecl *VectorOperations::load(const Value *V) {
-  auto PT = dyn_cast<PointerType>(V->getType());
-  assert(PT && "expected pointer type");
-  auto ET = PT->getElementType();
+FuncDecl *VectorOperations::load(const Value *V, Type *ET) {
+  assert(V->getType()->isPointerTy() && "expected pointer type");
   type(ET);
 
-  auto R = rep->regions->idx(V);
+  auto R = rep->regions->idx(V, ET);
   auto MT = rep->regions->get(R).getType();
   MT || (MT = IntegerType::get(V->getContext(), 8));
   auto FN = rep->opName(Naming::LOAD, {ET, MT});
   auto M = rep->memType(R);
-  auto P = rep->type(PT);
+  auto P = rep->type(V->getType());
   auto E = rep->type(ET);
   auto F = (MT == ET) ? Decl::function(FN, {{"M", M}, {"p", P}}, E,
                                        Expr::sel(Expr::id("M"), Expr::id("p")))
@@ -283,18 +282,16 @@ FuncDecl *VectorOperations::load(const Value *V) {
   return F;
 }
 
-FuncDecl *VectorOperations::store(const Value *V) {
-  auto PT = dyn_cast<PointerType>(V->getType());
-  assert(PT && "expected pointer type");
-  auto ET = PT->getElementType();
+FuncDecl *VectorOperations::store(const Value *V, Type *ET) {
+  assert(V->getType()->isPointerTy() && "expected pointer type");
   type(ET);
 
-  auto R = rep->regions->idx(V);
+  auto R = rep->regions->idx(V, ET);
   auto MT = rep->regions->get(R).getType();
   MT || (MT = IntegerType::get(V->getContext(), 8));
   auto FN = rep->opName(Naming::STORE, {ET, MT});
   auto M = rep->memType(R);
-  auto P = rep->type(PT);
+  auto P = rep->type(V->getType());
   auto E = rep->type(ET);
   auto F = (MT == ET) ? Decl::function(FN, {{"M", M}, {"p", P}, {"v", E}}, M,
                                        Expr::upd(Expr::id("M"), Expr::id("p"),

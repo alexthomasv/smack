@@ -4,6 +4,7 @@
 #include "smack/Regions.h"
 #include "smack/DSAWrapper.h"
 #include "smack/Debug.h"
+#include "smack/LlvmCompat.h"
 #include "smack/SmackOptions.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 
@@ -36,14 +37,16 @@ bool Region::isComplicated(const seadsa::Node *N) {
          N->isUnknown();
 }
 
-void Region::init(const Value *V, unsigned length) {
+void Region::init(const Value *V, const Type *accessType, unsigned length) {
   Type *T = V->getType();
   assert(T->isPointerTy() && "Expected pointer argument.");
-  T = T->getPointerElementType();
+  const Type *memoryType =
+      accessType ? accessType
+                 : (DSA ? DSA->getPointedType(V) : legacyPointerElementType(V));
   context = &V->getContext();
   representative =
       (DSA && !dyn_cast<ConstantPointerNull>(V)) ? DSA->getNode(V) : nullptr;
-  this->type = T;
+  this->type = memoryType;
   this->offset = DSA ? DSA->getOffset(V) : 0;
   this->length = length;
 
@@ -51,7 +54,8 @@ void Region::init(const Value *V, unsigned length) {
   allocated = !representative || isAllocated(representative);
   bytewise = DSA && SmackOptions::BitPrecise &&
              (SmackOptions::NoByteAccessInference ||
-              (!representative || !DSA->isTypeSafe(V)) || T->isIntegerTy(8));
+              (!representative || !DSA->isTypeSafe(V)) ||
+              (memoryType && memoryType->isIntegerTy(8)));
   incomplete = !representative || representative->isIncomplete();
   complicated = !representative || isComplicated(representative);
   collapsed = !representative || representative->isOffsetCollapsed();
@@ -60,10 +64,23 @@ void Region::init(const Value *V, unsigned length) {
 Region::Region(const Value *V) {
   unsigned length =
       DSA ? DSA->getPointedTypeSize(V) : std::numeric_limits<unsigned>::max();
-  init(V, length);
+  init(V, nullptr, length);
 }
 
-Region::Region(const Value *V, unsigned length) { init(V, length); }
+Region::Region(const Value *V, unsigned length) { init(V, nullptr, length); }
+
+Region::Region(const Value *V, const Type *accessType) {
+  unsigned length = std::numeric_limits<unsigned>::max();
+  if (accessType && accessType->isSized() && DL)
+    length = fixedTypeStoreSize(*DL, accessType);
+  else if (DSA)
+    length = DSA->getPointedTypeSize(V);
+  init(V, accessType, length);
+}
+
+Region::Region(const Value *V, const Type *accessType, unsigned length) {
+  init(V, accessType, length);
+}
 
 bool Region::isDisjoint(unsigned offset, unsigned length) {
   return this->offset + this->length <= offset ||
@@ -178,6 +195,23 @@ unsigned Regions::idx(const Value *V, unsigned length) {
   return idx(R);
 }
 
+unsigned Regions::idx(const Value *V, const Type *accessType) {
+  SDEBUG(errs() << "[regions] for: " << *V << " with access type ";
+         if (accessType) accessType->print(errs()); else errs() << "<unknown>";
+         errs() << "\n";);
+  Region R(V, accessType);
+  return idx(R);
+}
+
+unsigned Regions::idx(const Value *V, const Type *accessType,
+                      unsigned length) {
+  SDEBUG(errs() << "[regions] for: " << *V << " with access type ";
+         if (accessType) accessType->print(errs()); else errs() << "<unknown>";
+         errs() << " and length " << length << "\n";);
+  Region R(V, accessType, length);
+  return idx(R);
+}
+
 unsigned Regions::idx(Region &R) {
   unsigned r;
 
@@ -235,16 +269,20 @@ unsigned Regions::idx(Region &R) {
   return r;
 }
 
-void Regions::visitLoadInst(LoadInst &I) { idx(I.getPointerOperand()); }
+void Regions::visitLoadInst(LoadInst &I) {
+  idx(I.getPointerOperand(), I.getType());
+}
 
-void Regions::visitStoreInst(StoreInst &I) { idx(I.getPointerOperand()); }
+void Regions::visitStoreInst(StoreInst &I) {
+  idx(I.getPointerOperand(), I.getValueOperand()->getType());
+}
 
 void Regions::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
-  idx(I.getPointerOperand());
+  idx(I.getPointerOperand(), I.getCompareOperand()->getType());
 }
 
 void Regions::visitAtomicRMWInst(AtomicRMWInst &I) {
-  idx(I.getPointerOperand());
+  idx(I.getPointerOperand(), I.getValOperand()->getType());
 }
 
 void Regions::visitMemSetInst(MemSetInst &I) {
@@ -281,21 +319,25 @@ void Regions::visitCallInst(CallInst &I) {
     idx(&I);
 
   if (name.find("__SMACK_values") != std::string::npos) {
-    assert(I.getNumArgOperands() == 2 && "Expected two operands.");
+    assert(I.arg_size() == 2 && "Expected two operands.");
     const Value *P = I.getArgOperand(0);
     const Value *N = I.getArgOperand(1);
 
     while (isa<const CastInst>(P))
       P = dyn_cast<const CastInst>(P)->getOperand(0);
-    const PointerType *T = dyn_cast<PointerType>(P->getType());
-    assert(T && "Expected pointer argument.");
+    assert(P->getType()->isPointerTy() && "Expected pointer argument.");
 
     if (auto CI = dyn_cast<ConstantInt>(N)) {
       const unsigned bound = CI->getZExtValue();
       const DataLayout &DL = I.getModule()->getDataLayout();
-      const unsigned size = DL.getTypeStoreSize(T->getElementType());
+      const Type *T = legacyPointerElementType(P);
+      if (!T && !SmackOptions::NoMemoryRegionSplitting)
+        T = getAnalysis<DSAWrapper>().getPointedType(P);
+      if (!T)
+        T = Type::getInt8Ty(I.getContext());
+      const unsigned size = fixedTypeStoreSize(DL, T);
       const unsigned length = bound * size;
-      idx(P, length);
+      idx(P, T, length);
 
     } else {
       llvm_unreachable("Non-constant size expression not yet handled.");

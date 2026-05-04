@@ -26,6 +26,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Alignment.h"
@@ -91,9 +92,10 @@ bool AddTiming::runOnFunction(Function &F) {
 }
 
 void AddTiming::addTimingMetadata(Instruction *Inst) const {
-  unsigned Cost = getInstructionCost(Inst);
-  if (Cost != (unsigned)NO_TIMING_INFO) {
-    addMetadata(Inst, "smack.InstTimingCost.Int64", Cost);
+  auto Cost = getInstructionCost(Inst);
+  if (Cost.isValid()) {
+    addMetadata(Inst, "smack.InstTimingCost.Int64",
+                static_cast<unsigned>(Cost.getValue()));
   }
 }
 
@@ -104,7 +106,7 @@ void AddTiming::addNamingMetadata(Instruction *Inst) const {
   addMetadata(Inst, INSTRUCTION_NAME_METADATA, os.str());
 }
 
-static TargetTransformInfo::OperandValueKind getOperandInfo(Value *V) {
+static TargetTransformInfo::OperandValueInfo getOperandInfo(Value *V) {
   TargetTransformInfo::OperandValueKind OpInfo =
       TargetTransformInfo::OK_AnyValue;
 
@@ -115,12 +117,12 @@ static TargetTransformInfo::OperandValueKind getOperandInfo(Value *V) {
       OpInfo = TargetTransformInfo::OK_UniformConstantValue;
   }
 
-  return OpInfo;
+  return {OpInfo, TargetTransformInfo::OP_None};
 }
 
-unsigned AddTiming::getInstructionCost(const Instruction *I) const {
+InstructionCost AddTiming::getInstructionCost(const Instruction *I) const {
   if (!TTI)
-    return NO_TIMING_INFO;
+    return InstructionCost::getInvalid();
 
   // When an assume statement appears in the C code
   // llvm turns it into a series of IR instructions
@@ -132,13 +134,14 @@ unsigned AddTiming::getInstructionCost(const Instruction *I) const {
   // return 0
 
   if (VerifierCodeMetadata::isMarked(*I)) {
-    return 0;
+    return InstructionCost(0);
   }
 
   switch (I->getOpcode()) {
   case Instruction::GetElementPtr: {
-    Type *ValTy = I->getOperand(0)->getType()->getPointerElementType();
-    return TTI->getAddressComputationCost(ValTy);
+    return TTI->getAddressComputationCost(
+        I->getType(), nullptr, nullptr,
+        TargetTransformInfo::TargetCostKind::TCK_Latency);
   }
 
   case Instruction::Ret:
@@ -164,9 +167,9 @@ unsigned AddTiming::getInstructionCost(const Instruction *I) const {
   case Instruction::And:
   case Instruction::Or:
   case Instruction::Xor: {
-    TargetTransformInfo::OperandValueKind Op1VK =
+    TargetTransformInfo::OperandValueInfo Op1VK =
         getOperandInfo(I->getOperand(0));
-    TargetTransformInfo::OperandValueKind Op2VK =
+    TargetTransformInfo::OperandValueInfo Op2VK =
         getOperandInfo(I->getOperand(1));
     return TTI->getArithmeticInstrCost(
         I->getOpcode(), I->getType(),
@@ -175,12 +178,14 @@ unsigned AddTiming::getInstructionCost(const Instruction *I) const {
   case Instruction::Select: {
     const SelectInst *SI = cast<SelectInst>(I);
     Type *CondTy = SI->getCondition()->getType();
-    return TTI->getCmpSelInstrCost(I->getOpcode(), I->getType(), CondTy);
+    return TTI->getCmpSelInstrCost(I->getOpcode(), I->getType(), CondTy,
+                                   CmpInst::BAD_ICMP_PREDICATE);
   }
   case Instruction::ICmp:
   case Instruction::FCmp: {
     Type *ValTy = I->getOperand(0)->getType();
-    return TTI->getCmpSelInstrCost(I->getOpcode(), ValTy);
+    return TTI->getCmpSelInstrCost(I->getOpcode(), ValTy, nullptr,
+                                   CmpInst::BAD_ICMP_PREDICATE);
   }
   case Instruction::Store: {
     const StoreInst *SI = cast<StoreInst>(I);
@@ -188,7 +193,7 @@ unsigned AddTiming::getInstructionCost(const Instruction *I) const {
     assert(!ValTy->isStructTy() &&
            "Timing annotations do not currently work for struct sized stores");
     return TTI->getMemoryOpCost(I->getOpcode(), ValTy,
-                                Align(SI->getAlignment()),
+                                SI->getAlign(),
                                 SI->getPointerAddressSpace());
   }
   case Instruction::Load: {
@@ -196,7 +201,7 @@ unsigned AddTiming::getInstructionCost(const Instruction *I) const {
     assert(!I->getType()->isStructTy() &&
            "Timing annotations do not currently work for struct sized loads");
     return TTI->getMemoryOpCost(I->getOpcode(), I->getType(),
-                                Align(LI->getAlignment()),
+                                LI->getAlign(),
                                 LI->getPointerAddressSpace());
   }
   case Instruction::ZExt:
@@ -216,19 +221,15 @@ unsigned AddTiming::getInstructionCost(const Instruction *I) const {
     return TTI->getCastInstrCost(I->getOpcode(), I->getType(), SrcTy,
                                  TTI->getCastContextHint(I));
   }
-  case Instruction::ExtractElement: {
-    return NO_TIMING_INFO;
-  }
-  case Instruction::InsertElement: {
-    return NO_TIMING_INFO;
-  }
+  case Instruction::ExtractElement:
+  case Instruction::InsertElement:
   case Instruction::ShuffleVector: {
-    return NO_TIMING_INFO;
+    return InstructionCost::getInvalid();
   }
   case Instruction::Call: {
     if (const IntrinsicInst *II = dyn_cast<IntrinsicInst>(I)) {
       SmallVector<Type *, 4> Tys;
-      for (unsigned J = 0, JE = II->getNumArgOperands(); J != JE; ++J)
+      for (unsigned J = 0, JE = II->arg_size(); J != JE; ++J)
         Tys.push_back(II->getArgOperand(J)->getType());
 
       FastMathFlags FMF;
@@ -241,11 +242,11 @@ unsigned AddTiming::getInstructionCost(const Instruction *I) const {
           TargetTransformInfo::TargetCostKind::TCK_Latency);
     }
 
-    return NO_TIMING_INFO;
+    return InstructionCost::getInvalid();
   }
   default:
     // We don't have any information on this instruction.
-    return NO_TIMING_INFO;
+    return InstructionCost::getInvalid();
   }
 }
 
@@ -271,8 +272,8 @@ void AddTiming::print(raw_ostream &OS, const Module *) const {
   for (Function::iterator B = F->begin(), BE = F->end(); B != BE; ++B) {
     for (BasicBlock::iterator it = B->begin(), e = B->end(); it != e; ++it) {
       Instruction *Inst = &*it;
-      unsigned Cost = getInstructionCost(Inst);
-      if (Cost != (unsigned)NO_TIMING_INFO) {
+      auto Cost = getInstructionCost(Inst);
+      if (Cost.isValid()) {
         OS << "Cost Model: Found an estimated cost of " << Cost;
       } else {
         OS << "Cost Model: Unknown cost";

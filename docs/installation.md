@@ -74,13 +74,14 @@ to Docker's official documentation.
 
 SMACK depends on the following projects:
 
-* [LLVM][] version [12.0.1][LLVM-12.0.1]
-* [Clang][] version [12.0.1][Clang-12.0.1]
+* [LLVM][] version [22.1.4][LLVM-22.1.4]
+* [Clang][] version [22.1.4][Clang-22.1.4]
 * [Boost][] version 1.55 or greater
 * [Python][] version 3.6.8 or greater
 * [Ninja][] version 1.5.1 or greater
-* [Z3][] or compatible SMT-format theorem prover
-* [Boogie][] or [Corral][] or compatible Boogie-format verifier
+* [Z3][] 4.16.0 or compatible SMT-format theorem prover
+* [Boogie][] 3.5.6 or compatible Boogie-format verifier
+* [Corral][] is still supported as an optional legacy verifier
 * [sea-dsa][]
 
 See [here](https://github.com/smackers/smack/blob/main/bin/versions) for
@@ -92,7 +93,7 @@ installation instructions below for installing these requirements.
 Some distributions of Linux may have various SMACK dependencies like [Python][]
 installed out of the box. Nevertheless it is important to ensure that the
 required version numbers, as indicated above, are installed and selected for
-use. Generally speaking, apart from [Z3][], [Boogie][], and [Corral][], these
+use. Generally speaking, apart from [Z3][], [Boogie][], and optional [Corral][], these
 dependencies can be installed via the system's default package manager, such as
 `apt-get`, `rpm`, or `yast`. In some cases, it may be necessary to specify
 alternate package repositories for the system's default package manager, or to
@@ -174,7 +175,7 @@ should result in
 printed to standard output.
 
 Finally, note that the following LLVM and Clang binaries must be in your
-executable path: `clang`, `llvm-config`, `llvm-link`.
+executable path: `clang-22`, `clang++-22`, `llvm-config-22`, `llvm-link-22`.
 
 ### Verifying the SMACK Installation
 
@@ -189,9 +190,9 @@ shell in the `test` directory by executing
 [CMake]: http://www.cmake.org
 [Python]: http://www.python.org
 [LLVM]: http://llvm.org
-[LLVM-12.0.1]: http://llvm.org/releases/download.html#12.0.1
+[LLVM-22.1.4]: http://llvm.org/releases/download.html#22.1.4
 [Clang]: http://clang.llvm.org
-[Clang-12.0.1]: http://llvm.org/releases/download.html#12.0.1
+[Clang-22.1.4]: http://llvm.org/releases/download.html#22.1.4
 [Boogie]: https://github.com/boogie-org/boogie
 [Corral]: https://github.com/boogie-org/corral
 [Z3]: https://github.com/Z3Prover/z3/

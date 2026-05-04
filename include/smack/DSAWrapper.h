@@ -45,6 +45,7 @@ public:
   bool isMemOpd(const seadsa::Node *n);
   bool isRead(const llvm::Value *V);
   bool isSingletonGlobal(const llvm::Value *V);
+  const llvm::Type *getPointedType(const llvm::Value *v);
   unsigned getPointedTypeSize(const llvm::Value *v);
   unsigned getOffset(const llvm::Value *v);
   const seadsa::Node *getNode(const llvm::Value *v);

@@ -2,8 +2,6 @@
 // This file is distributed under the MIT License. See LICENSE for details.
 //
 
-#define DEBUG_TYPE "contracts"
-
 #include "smack/ExtractContracts.h"
 #include "smack/Debug.h"
 #include "smack/Naming.h"
@@ -14,6 +12,8 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
+
+#define DEBUG_TYPE "contracts"
 
 #include <map>
 #include <set>
@@ -188,7 +188,8 @@ Function *getContractExpr(Function *F, CallInst *I) {
     DestA->setName(A.getName());
     VMap[&A] = &*DestA++;
   }
-  CloneFunctionInto(NewF, F, VMap, false, Returns);
+  CloneFunctionInto(NewF, F, VMap, CloneFunctionChangeType::LocalChangesOnly,
+                    Returns);
   setReturnToArgumentValue(NewF, dyn_cast<CallInst>(VMap[I]));
   return NewF;
 }
@@ -246,7 +247,7 @@ bool ExtractContracts::runOnModule(Module &M) {
         // function
         for (auto Fs : getContractExprs(*newF)) {
           std::vector<Value *> Args;
-          for (auto &A : I->arg_operands())
+          for (auto &A : I->args())
             Args.push_back(A);
           auto *E = Builder.CreateCall(std::get<1>(Fs), Args);
           Builder.CreateCall(std::get<0>(Fs), {E});
@@ -275,7 +276,7 @@ bool ExtractContracts::runOnModule(Module &M) {
         // insert one invariant invocation per invocation in the original loop
         for (auto Fs : getContractExprs(*newF)) {
           std::vector<Value *> Args;
-          for (auto &A : I->arg_operands())
+          for (auto &A : I->args())
             Args.push_back(A);
           auto *E = Builder.CreateCall(std::get<1>(Fs), Args);
           Builder.CreateCall(std::get<0>(Fs), {E});

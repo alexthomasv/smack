@@ -3,6 +3,7 @@
 //
 #include "smack/MemorySafetyChecker.h"
 #include "smack/Debug.h"
+#include "smack/LlvmCompat.h"
 #include "smack/Naming.h"
 #include "smack/SmackOptions.h"
 #include "llvm/IR/Constants.h"
@@ -71,25 +72,22 @@ void MemorySafetyChecker::visitReturnInst(llvm::ReturnInst &I) {
 }
 
 namespace {
-Value *accessSizeAsPointer(Module &M, Value *V) {
-  auto T = dyn_cast<PointerType>(V->getType());
-  assert(T && "expected pointer type");
-
+Value *accessSizeAsPointer(Module &M, Type *T) {
   return ConstantExpr::getIntToPtr(
       ConstantInt::get(
           Type::getInt64Ty(M.getContext()),
-          M.getDataLayout().getTypeStoreSize(T->getPointerElementType())),
+          fixedTypeStoreSize(M.getDataLayout(), T)),
       PointerType::getUnqual(Type::getInt8Ty(M.getContext())));
 }
 
 Value *accessSizeAsPointer(LoadInst &I) {
   auto &M = *I.getParent()->getParent()->getParent();
-  return accessSizeAsPointer(M, I.getPointerOperand());
+  return accessSizeAsPointer(M, I.getType());
 }
 
 Value *accessSizeAsPointer(StoreInst &I) {
   auto &M = *I.getParent()->getParent()->getParent();
-  return accessSizeAsPointer(M, I.getPointerOperand());
+  return accessSizeAsPointer(M, I.getValueOperand()->getType());
 }
 } // namespace
 

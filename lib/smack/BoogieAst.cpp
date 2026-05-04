@@ -514,7 +514,32 @@ void BvConcat::print(std::ostream &os) const {
   os << "(" << left << "++" << right << ")";
 }
 
-void StringLit::print(std::ostream &os) const { os << "\"" << val << "\""; }
+void StringLit::print(std::ostream &os) const {
+  os << "\"";
+  for (char c : val) {
+    switch (c) {
+    case '\\':
+      os << "\\\\";
+      break;
+    case '"':
+      os << "\\\"";
+      break;
+    case '\n':
+      os << "\\n";
+      break;
+    case '\r':
+      os << "\\r";
+      break;
+    case '\t':
+      os << "\\t";
+      break;
+    default:
+      os << c;
+      break;
+    }
+  }
+  os << "\"";
+}
 
 void Attr::print(std::ostream &os) const {
   os << "{:" << name;

@@ -1,11 +1,12 @@
-FROM ubuntu:20.04
-MAINTAINER Shaobo He <polarishehn@gmail.com>
+FROM ubuntu:24.04
+LABEL maintainer="SMACK contributors"
 
 ENV SMACKDIR /home/user/smack
 
 RUN apt-get update && \
       apt-get -y install \
       software-properties-common \
+      ca-certificates \
       wget \
       sudo \
       g++

@@ -2,8 +2,8 @@ import os
 import sys
 import re
 import json
-from .utils import temporary_file, try_command, temporary_directory,\
-    llvm_exact_bin
+from .utils import temporary_file, try_command, temporary_directory, \
+    llvm_exact_bin, smack_headers, smack_lib
 from .versions import RUST_VERSION
 
 # Needed for cargo operations
@@ -66,24 +66,6 @@ def extra_libs():
         'rust': rust_build_libs,
         # coming soon - libraries for OBJC, Rust, Swift, etc.
     }
-
-
-def smack_root():
-    return os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[0])))
-
-
-def smack_header_path():
-    return os.path.join(smack_root(), 'share', 'smack', 'include')
-
-
-def smack_headers(args):
-    paths = []
-    paths.append(smack_header_path())
-    return paths
-
-
-def smack_lib():
-    return os.path.join(smack_root(), 'share', 'smack', 'lib')
 
 
 def extern_entry_points(args, bcs):
@@ -374,7 +356,9 @@ def default_rust_compile_args(args):
             '--cfg',
             'verifier="smack"',
             '-C',
-            'passes=name-anon-globals']
+            'passes=name-anon-globals',
+            '-C',
+            'panic=abort']
 
 
 def default_rust_compile_command(args):

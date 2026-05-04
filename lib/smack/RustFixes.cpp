@@ -7,6 +7,7 @@
 
 #include "smack/RustFixes.h"
 #include "smack/Naming.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -21,7 +22,7 @@ using namespace llvm;
 bool isRustNameMatch(StringRef search, StringRef name) {
   // Check if we are looking for a Rust mangled name with a 17 character hash
   // suffix, denoted by `17h'
-  bool hashed_match = search.endswith("17h") && name.startswith(search) &&
+  bool hashed_match = search.ends_with("17h") && name.starts_with(search) &&
                       search.size() + 17 == name.size();
   bool exact_match = search == name;
   return hashed_match || exact_match;
@@ -131,7 +132,26 @@ bool fixEntry(Function &main) {
   return instToErase.size();
 }
 
+// Currently deletes the body of the function. Ideally, this should
+// remove users to enable DCE
+void handleBlockedFunction(Function &F) { F.deleteBody(); }
+
 bool RustFixes::runOnFunction(Function &F) {
+  // These functions either cause very large BPL files or crash in translation.
+  // These functions either write to the console, or are in error paths that
+  // SMACK can otherwise detect.
+  static const std::vector<StringRef> blocked_fns = {
+      "_ZN4core3str16slice_error_fail",
+      "_ZN4core3fmt",
+      "__rg_oom",
+      "__rdl_oom",
+      "__alloc_error_handler",
+      "_ZN4core5slice22slice_index_order_fail",
+      "_ZN4core5slice24slice_end_index_len_fail",
+      "_ZN3std2io5Write9write_all",
+      "_ZN3std2io5Write9write_fmt",
+  };
+
   bool result = false;
   if (F.hasName()) {
     StringRef name = F.getName();
@@ -146,6 +166,12 @@ bool RustFixes::runOnFunction(Function &F) {
 
     if (name == "main") {
       result |= fixEntry(F);
+    }
+    for (auto &blocked : blocked_fns) {
+      if (name.find(blocked) != StringRef::npos) {
+        handleBlockedFunction(F);
+        result = true;
+      }
     }
     result |= replaceSpecialRustFunctions(F);
   }

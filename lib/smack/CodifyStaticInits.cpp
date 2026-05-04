@@ -8,6 +8,7 @@
 #include "smack/DSAWrapper.h"
 #include "smack/Debug.h"
 #include "smack/InitializePasses.h"
+#include "smack/LlvmCompat.h"
 #include "smack/Naming.h"
 #include "smack/SmackOptions.h"
 #include "llvm/IR/DataLayout.h"
@@ -50,11 +51,15 @@ bool CodifyStaticInits::runOnModule(Module &M) {
     worklist.pop_front();
 
     if (V->getType()->isIntegerTy() || V->getType()->isPointerTy() ||
-        V->getType()->isFloatingPointTy() || V->getType()->isVectorTy())
-
-      IRB.CreateStore(V, IRB.CreateGEP(P, ArrayRef<Value *>(I)));
-
-    else if (ArrayType *AT = dyn_cast<ArrayType>(V->getType()))
+        V->getType()->isFloatingPointTy() || V->getType()->isVectorTy()) {
+      Type *T = nullptr;
+      if (auto *G = dyn_cast<GlobalVariable>(P))
+        T = G->getValueType();
+      else
+        T = legacyPointerElementType(P);
+      assert(T && "Expected static initializer pointer element type.");
+      IRB.CreateStore(V, IRB.CreateGEP(T, P, ArrayRef<Value *>(I)));
+    } else if (ArrayType *AT = dyn_cast<ArrayType>(V->getType()))
       for (unsigned i = AT->getNumElements(); i-- > 0;) {
         auto A = V->getAggregateElement(i);
         std::vector<Value *> idxs(I);

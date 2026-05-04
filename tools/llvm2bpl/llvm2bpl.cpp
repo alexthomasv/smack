@@ -10,6 +10,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/LinkAllPasses.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
@@ -18,11 +19,11 @@
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/SourceMgr.h"
-#include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/IPO/Internalize.h"
 
 #include "seadsa/InitializePasses.hh"
 #include "seadsa/support/Debug.h"
@@ -113,10 +114,10 @@ static TargetMachine *GetTargetMachine(Triple TheTriple, StringRef CPUStr,
          "If we don't have a target machine, can't do timing analysis");
 
   return TheTarget->createTargetMachine(
-      TheTriple.getTriple(), CPUStr, FeaturesStr, Options,
+      TheTriple, CPUStr, FeaturesStr, Options,
       Reloc::Static,   /* was getRelocModel(),*/
-      None,            /* Use default CodeModel */
-      CodeGenOpt::None /*GetCodeGenOptLevel())*/
+      std::nullopt,    /* Use default CodeModel */
+      CodeGenOptLevel::None /*GetCodeGenOptLevel())*/
   );
 }
 } // namespace
@@ -174,7 +175,7 @@ int main(int argc, char **argv) {
              smack::Naming::isSmackName(name) ||
              name.find("__VERIFIER_assume") != llvm::StringRef::npos;
     };
-    pass_manager.add(llvm::createInternalizePass(PreserveKeyGlobals));
+    llvm::internalizeModule(*module, PreserveKeyGlobals);
     pass_manager.add(llvm::createGlobalDCEPass());
     pass_manager.add(llvm::createDeadCodeEliminationPass());
     pass_manager.add(llvm::createGlobalDCEPass());
@@ -192,7 +193,6 @@ int main(int argc, char **argv) {
 
   if (StaticUnroll) {
     pass_manager.add(llvm::createLoopSimplifyPass());
-    pass_manager.add(llvm::createLoopRotatePass());
     // pass_manager.add(llvm::createIndVarSimplifyPass());
     pass_manager.add(llvm::createLoopUnrollPass(32767));
   }
@@ -256,7 +256,7 @@ int main(int argc, char **argv) {
 
   if (!FinalIrFilename.empty()) {
     std::error_code EC;
-    auto F = new ToolOutputFile(FinalIrFilename.c_str(), EC, sys::fs::F_None);
+    auto F = new ToolOutputFile(FinalIrFilename.c_str(), EC, sys::fs::OF_None);
     if (EC)
       check(EC.message());
     F->keep();
@@ -266,7 +266,7 @@ int main(int argc, char **argv) {
 
   if (!OutputFilename.empty()) {
     std::error_code EC;
-    auto F = new ToolOutputFile(OutputFilename.c_str(), EC, sys::fs::F_None);
+    auto F = new ToolOutputFile(OutputFilename.c_str(), EC, sys::fs::OF_None);
     if (EC)
       check(EC.message());
     F->keep();

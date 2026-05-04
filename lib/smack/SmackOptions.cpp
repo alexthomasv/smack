@@ -43,6 +43,10 @@ const llvm::cl::opt<bool> SmackOptions::SourceLocSymbols(
     "source-loc-syms",
     llvm::cl::desc("Include source locations in generated code."));
 
+const llvm::cl::opt<bool> SmackOptions::ProvenanceSymbols(
+    "provenance-syms",
+    llvm::cl::desc("Include LLVM provenance annotations in generated code."));
+
 llvm::cl::opt<bool> SmackOptions::BitPrecise(
     "bit-precise", llvm::cl::desc("Model integer values as bit-vectors."));
 

@@ -43,33 +43,33 @@ void ContractsExtractor::visitCallInst(CallInst &ci) {
   string name = f && f->hasName() ? f->getName().str() : "";
 
   if (name == "forall") {
-    assert(ci.getNumArgOperands() == 2 && "Unexpected operands to forall.");
+    assert(ci.arg_size() == 2 && "Unexpected operands to forall.");
     Value *arg = ci.getArgOperand(1);
     ci.setArgOperand(1, sliceIdx(ci.getContext()));
     slices.push_back(extractSlice(arg));
 
   } else if (name == "exists") {
-    assert(ci.getNumArgOperands() == 2 && "Unexpected operands to exists.");
+    assert(ci.arg_size() == 2 && "Unexpected operands to exists.");
     Value *arg = ci.getArgOperand(1);
     ci.setArgOperand(1, sliceIdx(ci.getContext()));
     slices.push_back(extractSlice(arg));
 
   } else if (name == "requires") {
-    assert(ci.getNumArgOperands() == 1 && "Unexpected operands to requires.");
+    assert(ci.arg_size() == 1 && "Unexpected operands to requires.");
     Value *V = ci.getArgOperand(0);
     ci.setArgOperand(0, ConstantInt::getTrue(ci.getContext()));
     proc.addRequires(extractSlice(V)->getBoogieExpression(naming, rep));
     ci.eraseFromParent();
 
   } else if (name == "ensures") {
-    assert(ci.getNumArgOperands() == 1 && "Unexpected operands to ensures.");
+    assert(ci.arg_size() == 1 && "Unexpected operands to ensures.");
     Value *V = ci.getArgOperand(0);
     ci.setArgOperand(0, ConstantInt::getTrue(ci.getContext()));
     proc.addEnsures(extractSlice(V)->getBoogieExpression(naming, rep));
     ci.eraseFromParent();
 
   } else if (name == "invariant") {
-    assert(ci.getNumArgOperands() == 1 && "Unexpected operands to invariant.");
+    assert(ci.arg_size() == 1 && "Unexpected operands to invariant.");
 
     BasicBlock *body = ci.getParent();
     BasicBlock *head = body;

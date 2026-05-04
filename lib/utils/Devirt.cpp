@@ -62,7 +62,16 @@ castTo (Value * V, Type * Ty, std::string Name, Value * InsertPt) {
   // If it's a constant, just create a constant expression.
   //
   if (Constant * C = dyn_cast<Constant>(V)) {
-    Constant * CE = ConstantExpr::getZExtOrBitCast (C, Ty);
+    Constant *CE = nullptr;
+    if (C->getType()->isIntegerTy() && Ty->isIntegerTy()) {
+      auto srcBits = C->getType()->getIntegerBitWidth();
+      auto dstBits = Ty->getIntegerBitWidth();
+      CE = srcBits == dstBits ? C : ConstantExpr::getCast(
+                                      srcBits < dstBits ? Instruction::ZExt
+                                                        : Instruction::Trunc,
+                                      C, Ty);
+    } else
+      CE = ConstantExpr::getBitCast(C, Ty);
     return CE;
   }
 
@@ -163,8 +172,7 @@ Devirtualize::findInCache (const CallBase *CS,
     if (CS->getCalledOperand()->stripPointerCastsAndAliases()->getType() != PT)
       continue;
 
-    FunctionType* FT = dyn_cast<FunctionType>(PT->getElementType());
-    assert(FT);
+    FunctionType* FT = CS->getFunctionType();
     if (FT->isVarArg() && !checkArgs(CS, bounceFunc))
       continue;
 
@@ -403,7 +411,7 @@ Devirtualize::makeDirectCall (CallBase *CS) {
   if (CallInst* CI = dyn_cast<CallInst>(CS)) {
     std::vector<Value*> Params;
     Params.push_back(CI->getCalledOperand());
-    for (unsigned i=0; i<CI->getNumArgOperands(); i++) {
+    for (unsigned i=0; i<CI->arg_size(); i++) {
       Params.push_back(
         castTo(CI->getArgOperand(i), NF->getFunctionType()->getParamType(i+1), "", CS)
       );
@@ -419,7 +427,7 @@ Devirtualize::makeDirectCall (CallBase *CS) {
   } else if (InvokeInst* CI = dyn_cast<InvokeInst>(CS)) {
     std::vector<Value*> Params;
     Params.push_back(CI->getCalledOperand());
-    for (unsigned i=0; i<CI->getNumArgOperands(); i++)
+    for (unsigned i=0; i<CI->arg_size(); i++)
       Params.push_back(
         castTo(CI->getArgOperand(i), NF->getFunctionType()->getParamType(i+1), "", CS)
       );

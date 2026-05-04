@@ -134,7 +134,8 @@ bool SimplifyEV::runOnModule(Module& M) {
               Indices.push_back(ConstantInt::get(Int32Ty, *I));
             }
 
-            GetElementPtrInst *GEP = GetElementPtrInst::CreateInBounds(LI->getOperand(0), Indices,
+            GetElementPtrInst *GEP = GetElementPtrInst::CreateInBounds(LI->getType(),
+			                                               LI->getOperand(0), Indices,
                                                                        LI->getName(), LI) ;
             LoadInst *LINew = new LoadInst(GEP->getResultElementType(), GEP, "", LI);
             EV->replaceAllUsesWith(LINew);
@@ -201,7 +202,7 @@ bool SimplifyEV::runOnModule(Module& M) {
               Value *NewEV = ExtractValueInst::Create(IV->getAggregateOperand(),
                                                       EV->getIndices(), "", EV);
               Value *NewIV = InsertValueInst::Create(NewEV, IV->getInsertedValueOperand(),
-                                                     makeArrayRef(insi, inse), "", EV);
+                                                     ArrayRef<unsigned>(insi, inse - insi), "", EV);
               EV->replaceAllUsesWith(NewIV);
               SDEBUG(errs() << "EV:");
               SDEBUG(errs() << "ERASE:");
@@ -221,7 +222,7 @@ bool SimplifyEV::runOnModule(Module& M) {
               // with
               // %E extractvalue { i32 } { i32 42 }, 0
               ExtractValueInst *EV_new = ExtractValueInst::Create(IV->getInsertedValueOperand(),
-                                                                  makeArrayRef(exti, exte), "", EV);
+                                                                  ArrayRef<unsigned>(exti, exte - exti), "", EV);
               EV->replaceAllUsesWith(EV_new);
               SDEBUG(errs() << "EV:");
               SDEBUG(errs() << "ERASE:");

@@ -2,8 +2,10 @@
 # This file is distributed under the MIT License. See LICENSE for details.
 #
 
-cmake_minimum_required(VERSION 3.4.3)
+cmake_minimum_required(VERSION 3.20)
 project(smack)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT WIN32 OR MSYS OR CYGWIN)
 
@@ -34,6 +36,8 @@ if(NOT WIN32 OR MSYS OR CYGWIN)
   # Shaobo: enable O3 so SMACK can save some time.
   set(CMAKE_CXX_FLAGS
     "${LLVM_CXXFLAGS} -fno-exceptions -fno-rtti -O3")
+  set(SMACK_LLVM_COMPAT_HEADER
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/smack/LlvmCompat.h")
 
   execute_process(
     COMMAND ${LLVM_CONFIG_EXECUTABLE} --libs
@@ -85,6 +89,11 @@ endif()
 include_directories(include)
 include_directories(sea-dsa/include)
 
+function(smack_force_llvm_compat target)
+  target_compile_options(${target} PRIVATE
+    "-include" "${SMACK_LLVM_COMPAT_HEADER}")
+endfunction()
+
 add_library(utils STATIC
   include/utils/Devirt.h
   include/utils/MergeGEP.h
@@ -95,6 +104,7 @@ add_library(utils STATIC
   lib/utils/SimplifyInsertValue.cpp
   lib/utils/SimplifyExtractValue.cpp
 )
+smack_force_llvm_compat(utils)
 
 add_library(smackTranslator STATIC
   include/smack/AddTiming.h
@@ -103,6 +113,7 @@ add_library(smackTranslator STATIC
   include/smack/BplPrinter.h
   include/smack/DSAWrapper.h
   include/smack/InitializePasses.h
+  include/smack/LlvmCompat.h
   include/smack/Naming.h
   include/smack/Regions.h
   include/smack/SmackInstGenerator.h
@@ -154,19 +165,23 @@ add_library(smackTranslator STATIC
   lib/smack/Prelude.cpp
   lib/smack/SmackWarnings.cpp
 )
+smack_force_llvm_compat(smackTranslator)
 
 add_executable(llvm2bpl
   tools/llvm2bpl/llvm2bpl.cpp
 )
+smack_force_llvm_compat(llvm2bpl)
 
 add_library(externalizePass STATIC
   tools/externalizer/ExternalizePass.h
   tools/externalizer/ExternalizePass.cpp
 )
+smack_force_llvm_compat(externalizePass)
 
 add_executable(extern-statics
   tools/externalizer/extern-statics.cpp
 )
+smack_force_llvm_compat(extern-statics)
 
 # We need to include Boost header files at least for macOS
 find_package(Boost 1.55)
@@ -189,6 +204,9 @@ include(HandleLLVMOptions)
 set(SMACK_BUILD_TYPE "${CMAKE_BUILD_TYPE}")
 set(CMAKE_BUILD_TYPE "Release")
 add_subdirectory(sea-dsa/lib/seadsa)
+smack_force_llvm_compat(SeaDsaAnalysis)
+target_compile_definitions(SeaDsaAnalysis PRIVATE
+  SMACK_ENABLE_SEADSA_LEGACY_LLVM_NAMES)
 set(CMAKE_BUILD_TYPE ${SMACK_BUILD_TYPE})
 
 target_link_libraries(smackTranslator ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS}
@@ -221,7 +239,7 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/share/smack
   USE_SOURCE_PERMISSIONS
   FILES_MATCHING PATTERN "*.py" PATTERN "*.h" PATTERN "*.c" PATTERN "Makefile"
     PATTERN "*.rs" PATTERN "*.f90" PATTERN "*.di" PATTERN "*.toml"
-    PATTERN "*.cpp" PATTERN "cassert"
+    PATTERN "*.cpp" PATTERN "cassert" PATTERN "*.yaml"
 )
 
 install(FILES

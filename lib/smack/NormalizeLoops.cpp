@@ -37,8 +37,7 @@ BasicBlock *makeForwardingBlock(BasicBlock *target) {
   auto &context = target->getContext();
   BasicBlock *result =
       BasicBlock::Create(context, "forwarder", target->getParent());
-  BranchInst *branch = BranchInst::Create(target);
-  result->getInstList().push_back(branch);
+  BranchInst::Create(target, result);
   return result;
 }
 

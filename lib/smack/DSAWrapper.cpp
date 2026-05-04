@@ -8,9 +8,11 @@
 #include "seadsa/InitializePasses.hh"
 #include "smack/Debug.h"
 #include "smack/InitializePasses.h"
+#include "smack/LlvmCompat.h"
 #include "smack/SmackOptions.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Support/FileSystem.h"
 
 #include <set>
@@ -91,15 +93,54 @@ bool DSAWrapper::isRead(const Value *V) {
   return node->isRead();
 }
 
-unsigned DSAWrapper::getPointedTypeSize(const Value *v) {
-  if (llvm::PointerType *t = llvm::dyn_cast<llvm::PointerType>(v->getType())) {
-    llvm::Type *pointedType = t->getElementType();
-    if (pointedType->isSized())
-      return dataLayout->getTypeStoreSize(pointedType);
-    else
-      return UINT_MAX;
-  } else
+const Type *DSAWrapper::getPointedType(const Value *v) {
+  if (!v->getType()->isPointerTy())
     llvm_unreachable("Type should be pointer.");
+
+  if (auto *T = legacyPointerElementType(v))
+    return T;
+
+  if (auto *AI = dyn_cast<AllocaInst>(v))
+    return AI->getAllocatedType();
+
+  if (auto *GV = dyn_cast<GlobalVariable>(v))
+    return GV->getValueType();
+
+  if (auto *GEP = dyn_cast<GetElementPtrInst>(v))
+    return GEP->getResultElementType();
+
+  if (auto *GEP = dyn_cast<GEPOperator>(v))
+    return GEP->getResultElementType();
+
+  auto *node = getNode(v);
+  if (!node)
+    return nullptr;
+
+  const auto &types = node->types();
+  auto offset = getOffset(v);
+  auto it = types.find(offset);
+  if (it == types.end() || it->second.begin() == it->second.end())
+    return nullptr;
+
+  const Type *best = nullptr;
+  uint64_t bestSize = 0;
+  for (auto *T : it->second) {
+    if (!T || !T->isSized())
+      continue;
+    uint64_t size = fixedTypeStoreSize(*dataLayout, T);
+    if (!best || size > bestSize) {
+      best = T;
+      bestSize = size;
+    }
+  }
+  return best;
+}
+
+unsigned DSAWrapper::getPointedTypeSize(const Value *v) {
+  const Type *pointedType = getPointedType(v);
+  if (pointedType && pointedType->isSized())
+    return fixedTypeStoreSize(*dataLayout, pointedType);
+  return UINT_MAX;
 }
 
 unsigned DSAWrapper::getOffset(const Value *v) {
@@ -161,8 +202,7 @@ bool DSAWrapper::isTypeSafe(const Value *v) {
       unsigned fieldLength = 0;
       for (auto &t : typeSet) {
         // TODO: fix the const_cast
-        unsigned length =
-            dataLayout->getTypeStoreSize(const_cast<llvm::Type *>(t));
+        unsigned length = fixedTypeStoreSize(*dataLayout, t);
         if (length > fieldLength)
           fieldLength = length;
       }

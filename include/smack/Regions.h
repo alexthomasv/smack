@@ -40,12 +40,14 @@ private:
   static bool isAllocated(const seadsa::Node *N);
   static bool isComplicated(const seadsa::Node *N);
 
-  void init(const Value *V, unsigned length);
+  void init(const Value *V, const Type *accessType, unsigned length);
   bool isDisjoint(unsigned offset, unsigned length);
 
 public:
   Region(const Value *V);
   Region(const Value *V, unsigned length);
+  Region(const Value *V, const Type *accessType);
+  Region(const Value *V, const Type *accessType, unsigned length);
 
   static void init(Module &M, Pass &P);
 
@@ -74,6 +76,9 @@ public:
   unsigned size() const;
   unsigned idx(const llvm::Value *v);
   unsigned idx(const llvm::Value *v, unsigned length);
+  unsigned idx(const llvm::Value *v, const llvm::Type *accessType);
+  unsigned idx(const llvm::Value *v, const llvm::Type *accessType,
+               unsigned length);
   Region &get(unsigned R);
 
   // void visitModule(Module& M) {

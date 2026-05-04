@@ -28,7 +28,7 @@ INSTALL_Z3=${INSTALL_Z3:-1}
 INSTALL_CVC4=${INSTALL_CVC4:-0}
 INSTALL_YICES2=${INSTALL_YICES2:-0}
 INSTALL_BOOGIE=${INSTALL_BOOGIE:-1}
-INSTALL_CORRAL=${INSTALL_CORRAL:-1}
+INSTALL_CORRAL=${INSTALL_CORRAL:-0}
 BUILD_SYMBOOGLIX=${BUILD_SYMBOOGLIX:-0}
 BUILD_LOCKPWN=${BUILD_LOCKPWN:-0}
 BUILD_SMACK=${BUILD_SMACK:-1}
@@ -60,7 +60,7 @@ source ${SMACK_DIR}/bin/versions
 
 SMACKENV=${ROOT_DIR}/smack.environment
 WGET="wget --no-verbose"
-Z3_DOWNLOAD_LINK="https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/z3-${Z3_VERSION}-x64-glibc-2.31.zip"
+Z3_DOWNLOAD_LINK=${Z3_DOWNLOAD_LINK:-"https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/z3-${Z3_VERSION}-x64-glibc-${Z3_GLIBC_VERSION}.zip"}
 
 # Install prefix -- system default is used if left unspecified
 INSTALL_PREFIX=
@@ -68,7 +68,7 @@ CONFIGURE_INSTALL_PREFIX=
 CMAKE_INSTALL_PREFIX=
 
 # Partial list of dependencies; the rest are added depending on the platform
-DEPENDENCIES="git cmake python3-yaml python3-psutil python3-toml unzip wget ninja-build apt-transport-https dotnet-sdk-5.0 libboost-all-dev"
+DEPENDENCIES="git cmake python3-yaml python3-psutil python3-toml unzip wget ninja-build apt-transport-https dotnet-sdk-8.0 libboost-all-dev"
 
 shopt -s extglob
 
@@ -198,7 +198,7 @@ linux-opensuse*)
   DEPENDENCIES+=" ncurses-devel"
   ;;
 
-linux-@(ubuntu|neon)-@(16|18|20)*)
+linux-@(ubuntu|neon)-@(16|18|20|22|24|25)*)
   if [ ${INSTALL_LLVM} -eq 1 ] ; then
     DEPENDENCIES+=" clang-${LLVM_SHORT_VERSION} llvm-${LLVM_SHORT_VERSION}-dev"
   fi
@@ -240,7 +240,7 @@ if [ ${INSTALL_DEPENDENCIES} -eq 1 ] ; then
     sudo zypper --non-interactive install ${DEPENDENCIES}
     ;;
 
-  linux-@(ubuntu|neon)-@(1[68]|20)*)
+  linux-@(ubuntu|neon)-@(1[68]|20|22|24|25)*)
     RELEASE_VERSION=$(get-platform-trim "$(lsb_release -r)" | awk -F: '{print $2;}')
     case "$RELEASE_VERSION" in
     16*)
@@ -251,6 +251,18 @@ if [ ${INSTALL_DEPENDENCIES} -eq 1 ] ; then
       ;;
     20*)
       UBUNTU_CODENAME="focal"
+      ;;
+    22*)
+      UBUNTU_CODENAME="jammy"
+      ;;
+    24*)
+      UBUNTU_CODENAME="noble"
+      ;;
+    25.04*)
+      UBUNTU_CODENAME="plucky"
+      ;;
+    25.10*)
+      UBUNTU_CODENAME="questing"
       ;;
     *)
       puts "Release ${RELEASE_VERSION} for ${distro} not supported. Dependencies must be installed manually."
@@ -264,8 +276,10 @@ if [ ${INSTALL_DEPENDENCIES} -eq 1 ] ; then
 
     # Adding LLVM repository
     if [ ${INSTALL_LLVM} -eq 1 ] ; then
-      ${WGET} -O - http://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-      sudo add-apt-repository "deb http://apt.llvm.org/${UBUNTU_CODENAME}/ llvm-toolchain-${UBUNTU_CODENAME}-${LLVM_SHORT_VERSION} main"
+      sudo install -d -m 0755 /etc/apt/keyrings
+      ${WGET} -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/keyrings/apt.llvm.org.asc >/dev/null
+      LLVM_APT_SUITE="llvm-toolchain-${UBUNTU_CODENAME}-${LLVM_SHORT_VERSION}"
+      echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/${UBUNTU_CODENAME}/ ${LLVM_APT_SUITE} main" | sudo tee /etc/apt/sources.list.d/apt.llvm.org.list
     fi
 
     # Adding .NET repository
@@ -300,18 +314,16 @@ fi
 
 if [ ${BUILD_LLVM} -eq 1 ] ; then
   puts "Building LLVM"
-  mkdir -p ${LLVM_DIR}/src/{tools/clang,projects/compiler-rt}
+  mkdir -p ${LLVM_DIR}/src
   mkdir -p ${LLVM_DIR}/build
-  ${WGET} https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_FULL_VERSION}/llvm-${LLVM_FULL_VERSION}.src.tar.xz
-  ${WGET} https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_FULL_VERSION}/clang-${LLVM_FULL_VERSION}.src.tar.xz
-  ${WGET} https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_FULL_VERSION}/compiler-rt-${LLVM_FULL_VERSION}.src.tar.xz
+  ${WGET} https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_FULL_VERSION}/llvm-project-${LLVM_FULL_VERSION}.src.tar.xz
 
-  tar -C ${LLVM_DIR}/src -xvf llvm-${LLVM_FULL_VERSION}.src.tar.xz --strip 1
-  tar -C ${LLVM_DIR}/src/tools/clang -xvf clang-${LLVM_FULL_VERSION}.src.tar.xz --strip 1
-  tar -C ${LLVM_DIR}/src/projects/compiler-rt -xvf compiler-rt-${LLVM_FULL_VERSION}.src.tar.xz --strip 1
+  tar -C ${LLVM_DIR}/src -xvf llvm-project-${LLVM_FULL_VERSION}.src.tar.xz --strip 1
 
   cd ${LLVM_DIR}/build/
-  cmake -G "Unix Makefiles" ${CMAKE_INSTALL_PREFIX} -DCMAKE_BUILD_TYPE=Release ../src
+  cmake -G "Unix Makefiles" ${CMAKE_INSTALL_PREFIX} \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLVM_ENABLE_PROJECTS="clang;compiler-rt" ../src/llvm
   make
   sudo make install
   puts "Built LLVM"
