@@ -1,6 +1,8 @@
 use std::alloc::{alloc, Layout, System};
 use std::ptr;
 
+// @expect verified
+
 pub struct File {
     buf: Box<u8>,
 }

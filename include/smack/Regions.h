@@ -65,11 +65,12 @@ public:
 class Regions : public ModulePass, public InstVisitor<Regions> {
 private:
   std::vector<Region> regions;
+  bool finalized;
   unsigned idx(Region &R);
 
 public:
   static char ID;
-  Regions() : ModulePass(ID) {}
+  Regions() : ModulePass(ID), finalized(false) {}
   virtual void getAnalysisUsage(llvm::AnalysisUsage &AU) const override;
   virtual bool runOnModule(llvm::Module &M) override;
 

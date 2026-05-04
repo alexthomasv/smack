@@ -1,6 +1,8 @@
 use std::alloc::{alloc, Layout, System};
 use std::ptr;
 
+// @skip
+
 struct S {
     data: &i32,
 }

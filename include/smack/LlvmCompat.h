@@ -5,12 +5,10 @@
 #define SMACK_LLVM_COMPAT_H
 
 #include "llvm/Config/llvm-config.h"
-#include "llvm/IR/DataLayout.h"
-#include "llvm/IR/DerivedTypes.h"
-#include "llvm/IR/Type.h"
-#include "llvm/IR/Value.h"
 
-#if LLVM_VERSION_MAJOR >= 16
+#if LLVM_VERSION_MAJOR < 16
+#include "llvm/ADT/Optional.h"
+#else
 #include <optional>
 #include <utility>
 
@@ -37,6 +35,11 @@ public:
 inline constexpr std::nullopt_t None = std::nullopt;
 } // namespace llvm
 #endif
+
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Value.h"
 
 #if LLVM_VERSION_MAJOR >= 22 && defined(SMACK_ENABLE_SEADSA_LEGACY_LLVM_NAMES)
 #define getFixedSize getFixedValue

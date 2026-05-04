@@ -32,6 +32,7 @@ private:
   Block *currBlock;
   llvm::BasicBlock::const_iterator nextInst;
   std::map<const llvm::BasicBlock *, Block *> blockMap;
+  std::map<const llvm::Loop *, std::list<const Expr *>> loopInvariants;
   std::map<const llvm::Value *, std::string> sourceNames;
 
   // Cache of source file lines by filename.
@@ -48,6 +49,12 @@ private:
   void processInstruction(llvm::Instruction &i);
   void nameInstruction(llvm::Instruction &i);
   void annotate(llvm::Instruction &i, Block *b);
+  void hoistLoopStmtToHeader(const llvm::Loop *loop, const Stmt *stmt);
+  void hoistLoopStmtsToHeader(const llvm::Loop *loop,
+                              std::list<const Stmt *> stmts);
+  const llvm::Loop *invariantLoopForHeader(
+      const llvm::BasicBlock *header) const;
+  void addLoopInvariantChecks(Block *block, const llvm::Loop *loop);
   unsigned instructionIndex(const llvm::Instruction &i) const;
   std::string llvmInstructionId(const llvm::Instruction &i) const;
 

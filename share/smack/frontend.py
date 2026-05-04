@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import json
+import shutil
 from .utils import temporary_file, try_command, temporary_directory, \
     llvm_exact_bin, smack_headers, smack_lib
 from .versions import RUST_VERSION
@@ -92,7 +93,11 @@ def default_clang_compile_command(args, lib=False):
            '-emit-llvm',
            '-O0',
            '-g',
-           '-gcolumn-info'
+           '-gcolumn-info',
+           '-Wno-error=implicit-function-declaration',
+           '-Wno-error=implicit-int',
+           '-Wno-error=int-conversion',
+           '-Wno-error=incompatible-pointer-types'
           ]
     # Starting from LLVM 5.0, we need the following two options
     # in order to enable optimization passes.
@@ -298,11 +303,52 @@ def default_cargo_compile_command(args):
         'cargo',
         '+' + RUST_VERSION,
         'build']
+    if os.environ.get('SMACK_CARGO_ALLOW_NETWORK') != '1':
+        compile_command.append('--offline')
     return compile_command + args
 
 
 def cargo_frontend(input_file, args):
     """Generate LLVM bitcode from a cargo build."""
+
+    def copy_cargo_package(manifest):
+        package_dir = os.path.dirname(os.path.realpath(manifest))
+        work_dir = temporary_directory(
+            os.path.splitext(os.path.basename(package_dir))[0],
+            None,
+            args)
+        package_copy = os.path.join(work_dir, 'package')
+        shutil.copytree(
+            package_dir,
+            package_copy,
+            ignore=shutil.ignore_patterns('target', 'Cargo.lock'))
+        return os.path.join(package_copy, os.path.basename(manifest))
+
+    def verifier_smack_crate(work_dir):
+        crate_dir = os.path.join(work_dir, 'smack')
+        shutil.copytree(
+            smack_lib(),
+            crate_dir,
+            ignore=shutil.ignore_patterns(
+                'target', 'Cargo.lock', '*.a', '*.bc', '*.o'))
+
+        manifest = os.path.join(crate_dir, 'Cargo.toml')
+        config = toml.load(manifest)
+        config.setdefault('build-dependencies', {})['cc'] = '=1.0.72'
+        with open(manifest, 'w') as f:
+            toml.dump(config, f)
+
+        return crate_dir
+
+    input_file = copy_cargo_package(input_file)
+    config = toml.load(input_file)
+    smack_crate = verifier_smack_crate(os.path.dirname(input_file))
+    if isinstance(config.get('dependencies'), dict):
+        smack_dep = config['dependencies'].get('smack')
+        if isinstance(smack_dep, dict) and 'path' in smack_dep:
+            smack_dep['path'] = smack_crate
+            with open(input_file, 'w') as f:
+                toml.dump(config, f)
 
     def find_target(config, options=None):
         target_name = config['package']['name']
@@ -325,7 +371,7 @@ def cargo_frontend(input_file, args):
     try_command(compile_command, console=True,
                 env={'RUSTFLAGS': " ".join(rustargs)})
 
-    target_name = find_target(toml.load(input_file))
+    target_name = find_target(config)
 
     # Find the name of the crate's bc file
     bcbase = targetdir + '/debug/deps/'
@@ -352,7 +398,8 @@ def default_rust_compile_args(args):
             'opt-level=0',
             '-C',
             'no-prepopulate-passes',
-            '-g',
+            '-C',
+            'debuginfo=0',
             '--cfg',
             'verifier="smack"',
             '-C',

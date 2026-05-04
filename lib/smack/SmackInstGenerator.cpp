@@ -10,6 +10,7 @@
 #include "smack/SmackRep.h"
 #include "smack/VectorOperations.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/ADT/FloatingPointMode.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/InstVisitor.h"
@@ -91,6 +92,76 @@ void SmackInstGenerator::nameInstruction(llvm::Instruction &inst) {
     return;
   proc->getDeclarations().push_back(
       Decl::variable(naming->get(inst), rep->type(&inst)));
+}
+
+void SmackInstGenerator::hoistLoopStmtToHeader(const llvm::Loop *loop,
+                                               const Stmt *stmt) {
+  hoistLoopStmtsToHeader(loop, {stmt});
+}
+
+void SmackInstGenerator::hoistLoopStmtsToHeader(
+    const llvm::Loop *loop, std::list<const Stmt *> stmtsToHoist) {
+  if (!loop) {
+    for (auto *stmt : stmtsToHoist)
+      emit(stmt);
+    return;
+  }
+
+  auto *header = loop->getHeader();
+  if (!header || !blockMap.count(header)) {
+    for (auto *stmt : stmtsToHoist)
+      emit(stmt);
+    return;
+  }
+
+  auto &stmts = blockMap[header]->getStatements();
+  auto insertAt = stmts.begin();
+
+  if (insertAt != stmts.end()) {
+    if (auto *assume = llvm::dyn_cast<const AssumeStmt>(*insertAt)) {
+      if (assume->hasAttr("loop_header"))
+        ++insertAt;
+    }
+  }
+
+  while (insertAt != stmts.end() &&
+         (*insertAt)->getKind() == Stmt::ASSIGN) {
+    ++insertAt;
+  }
+
+  for (auto *stmt : stmtsToHoist) {
+    insertAt = stmts.insert(insertAt, stmt);
+    ++insertAt;
+  }
+}
+
+const llvm::Loop *
+SmackInstGenerator::invariantLoopForHeader(
+    const llvm::BasicBlock *header) const {
+  for (auto *loop = loops.getLoopFor(header); loop;
+       loop = loop->getParentLoop()) {
+    if (loop->getHeader() == header && loopInvariants.count(loop))
+      return loop;
+  }
+  return nullptr;
+}
+
+void SmackInstGenerator::addLoopInvariantChecks(Block *block,
+                                                const llvm::Loop *loop) {
+  if (!loop)
+    return;
+
+  for (auto &I : *loop->getHeader()) {
+    if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&I)) {
+      std::string phiName = naming->get(*phi);
+      block->addStmt(
+          Stmt::assign(Expr::id(phiName + ".pre"), Expr::id(phiName)));
+    }
+  }
+
+  auto *attr = Attr::attr(Naming::LOOP_INVARIANT_ANNOTATION);
+  for (auto *expr : loopInvariants[loop])
+    block->addStmt(Stmt::assert_(expr, {attr}));
 }
 
 std::string SmackInstGenerator::getSourceLine(const std::string &filename,
@@ -344,6 +415,7 @@ void SmackInstGenerator::generateGotoStmts(
     for (unsigned i = 0; i < targets.size(); i++) {
       const Expr *condition = targets[i].first;
       llvm::BasicBlock *target = targets[i].second;
+      auto *invariantLoop = invariantLoopForHeader(target);
 
       // Tag every branch-target assume with ``:partition``.  Boogie
       // already emits this attribute when it desugars structured
@@ -357,7 +429,15 @@ void SmackInstGenerator::generateGotoStmts(
       // to the alloc partitions.
       const Attr *partitionAttr = Attr::attr("partition");
 
-      if (target->getUniquePredecessor() == inst.getParent()) {
+      if (invariantLoop) {
+        Block *b = createBlock();
+        annotate(inst, b);
+        b->addStmt(Stmt::assume(condition, partitionAttr));
+        addLoopInvariantChecks(b, invariantLoop);
+        b->addStmt(Stmt::goto_({getBlock(target)->getName()}));
+        dispatch.push_back(b->getName());
+
+      } else if (target->getUniquePredecessor() == inst.getParent()) {
         Block *b = getBlock(target);
         b->insert(Stmt::assume(condition, partitionAttr));
         dispatch.push_back(b->getName());
@@ -373,8 +453,14 @@ void SmackInstGenerator::generateGotoStmts(
 
     emit(Stmt::goto_(dispatch));
 
-  } else
-    emit(Stmt::goto_({getBlock(targets[0].second)->getName()}));
+  } else {
+    auto *target = targets[0].second;
+    auto *invariantLoop = invariantLoopForHeader(target);
+    if (invariantLoop) {
+      addLoopInvariantChecks(currBlock, invariantLoop);
+    }
+    emit(Stmt::goto_({getBlock(target)->getName()}));
+  }
 }
 
 /******************************************************************************/
@@ -897,12 +983,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     }
 
     if (L && boogieCode.find("loop_invariant") != std::string::npos) {
-      auto H = L->getHeader();
-      if (H && blockMap.count(H)) {
-        blockMap[H]->getStatements().push_front(Stmt::code(boogieCode));
-      } else {
-        emit(Stmt::code(boogieCode));
-      }
+      hoistLoopStmtToHeader(L, Stmt::code(boogieCode));
     } else {
       emit(Stmt::code(boogieCode));
     }
@@ -991,16 +1072,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
 
     // Hoist to loop header (same logic as __SMACK_code)
     auto L = loops[ci.getParent()];
-    if (L) {
-      auto H = L->getHeader();
-      if (H && blockMap.count(H)) {
-        blockMap[H]->getStatements().push_front(Stmt::code(boogieCode));
-      } else {
-        emit(Stmt::code(boogieCode));
-      }
-    } else {
-      emit(Stmt::code(boogieCode));
-    }
+    hoistLoopStmtToHeader(L, Stmt::code(boogieCode));
 
   } else if (name.find(Naming::DECL_PROC) != StringRef::npos) {
     std::string code = rep->code(ci);
@@ -1080,10 +1152,9 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     else {
       auto L = loops[ci.getParent()];
       assert(L);
-      auto H = L->getHeader();
-      assert(H && blockMap.count(H));
-      blockMap[H]->getStatements().push_front(
-          Stmt::assert_(E, {Attr::attr(Naming::LOOP_INVARIANT_ANNOTATION)}));
+      auto *attr = Attr::attr(Naming::LOOP_INVARIANT_ANNOTATION);
+      loopInvariants[L].push_back(E);
+      hoistLoopStmtToHeader(L, Stmt::assume(E, attr));
     }
 
     // } else if (name == "result") {
@@ -1494,6 +1565,66 @@ void SmackInstGenerator::visitIntrinsicInst(llvm::IntrinsicInst &ii) {
         {&SmackOptions::FloatEnabled});
   };
 
+  static const auto isFpClass = conditionalModel(
+      [this](CallInst *ci) {
+        auto *arg = ci->getArgOperand(0);
+        auto *maskConst = dyn_cast<ConstantInt>(ci->getArgOperand(1));
+        if (!maskConst) {
+          SmackWarnings::warnApproximate(
+              ci->getCalledFunction()->getName().str(), currBlock, ci);
+          emit(rep->call(ci->getCalledFunction(), *ci));
+          return;
+        }
+
+        auto mask = maskConst->getZExtValue();
+        auto type = rep->type(arg->getType());
+        auto value = rep->expr(arg);
+        auto boolPred = [type, value](std::string name) {
+          return Expr::fn(indexedName(name, {type, Naming::BOOL_TYPE}), value);
+        };
+        auto signedPred = [&](const Expr *classPred, bool negative) {
+          auto sign = boolPred(negative ? "$isnegative" : "$ispositive");
+          return Expr::and_(classPred, sign);
+        };
+
+        const Expr *pred = Expr::lit(false);
+        auto add = [&](bool include, const Expr *classPred) {
+          if (include)
+            pred = Expr::or_(pred, classPred);
+        };
+        auto addSignedClass = [&](uint64_t negMask, uint64_t posMask,
+                                  std::string className) {
+          bool neg = (mask & negMask) != 0;
+          bool pos = (mask & posMask) != 0;
+          auto classPred = boolPred(className);
+          if (neg && pos)
+            add(true, classPred);
+          else if (neg)
+            add(true, signedPred(classPred, true));
+          else if (pos)
+            add(true, signedPred(classPred, false));
+        };
+
+        if ((mask & llvm::fcNan) == llvm::fcNan)
+          add(true, boolPred("$isnan"));
+        else if (mask & llvm::fcNan) {
+          SmackWarnings::warnApproximate("llvm.is.fpclass nan subclass",
+                                         currBlock, ci);
+          add(true, boolPred("$isnan"));
+        }
+
+        addSignedClass(llvm::fcNegInf, llvm::fcPosInf, "$isinfinite");
+        addSignedClass(llvm::fcNegNormal, llvm::fcPosNormal, "$isnormal");
+        addSignedClass(llvm::fcNegSubnormal, llvm::fcPosSubnormal,
+                       "$issubnormal");
+        addSignedClass(llvm::fcNegZero, llvm::fcPosZero, "$iszero");
+
+        emit(Stmt::assign(rep->expr(ci),
+                          Expr::ifThenElse(pred, rep->integerLit(1ULL, 1),
+                                           rep->integerLit(0ULL, 1))));
+      },
+      {&SmackOptions::FloatEnabled});
+
   static const auto identity = [this](CallInst *ci) {
     // translation: $res := $arg1
     Value *val = ci->getArgOperand(0);
@@ -1521,6 +1652,7 @@ void SmackInstGenerator::visitIntrinsicInst(llvm::IntrinsicInst &ii) {
           {llvm::Intrinsic::expect, identity},
           {llvm::Intrinsic::fabs, assignUnFPFuncApp("$abs")},
           {llvm::Intrinsic::fma, fma},
+          {llvm::Intrinsic::is_fpclass, isFpClass},
           {llvm::Intrinsic::sqrt, assignUnFPFuncApp("$sqrt")},
           {llvm::Intrinsic::maxnum, assignBinFPFuncApp("$max")},
           {llvm::Intrinsic::minnum, assignBinFPFuncApp("$min")},

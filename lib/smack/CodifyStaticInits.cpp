@@ -17,6 +17,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <deque>
+#include <functional>
 #include <queue>
 #include <set>
 #include <vector>
@@ -38,17 +39,37 @@ bool CodifyStaticInits::runOnModule(Module &M) {
   IRBuilder<> IRB(B);
 
   std::deque<std::tuple<Constant *, Constant *, std::vector<Value *>>> worklist;
+  std::set<GlobalVariable *> queuedGlobals;
+
+  auto enqueueGlobal = [&](GlobalVariable *G) {
+    if (G->hasInitializer() && queuedGlobals.insert(G).second)
+      worklist.push_back(
+          std::make_tuple(G->getInitializer(), G, std::vector<Value *>()));
+  };
+
+  std::function<void(Constant *)> enqueueReferencedGlobals =
+      [&](Constant *Cst) {
+        if (auto *GV = dyn_cast<GlobalVariable>(Cst->stripPointerCasts())) {
+          enqueueGlobal(GV);
+          return;
+        }
+
+        for (Value *Op : Cst->operands())
+          if (auto *OpC = dyn_cast<Constant>(Op))
+            enqueueReferencedGlobals(OpC);
+      };
 
   for (auto &G : M.globals())
     if (G.hasInitializer() && DSA->isRead(&G))
-      worklist.push_back(
-          std::make_tuple(G.getInitializer(), &G, std::vector<Value *>()));
+      enqueueGlobal(&G);
 
   while (worklist.size()) {
     Constant *V = std::get<0>(worklist.front());
     Constant *P = std::get<1>(worklist.front());
     std::vector<Value *> I = std::get<2>(worklist.front());
     worklist.pop_front();
+
+    enqueueReferencedGlobals(V);
 
     if (V->getType()->isIntegerTy() || V->getType()->isPointerTy() ||
         V->getType()->isFloatingPointTy() || V->getType()->isVectorTy()) {

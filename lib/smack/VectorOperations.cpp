@@ -13,7 +13,7 @@ using namespace llvm;
 
 namespace smack {
 std::string VectorOperations::constructor(Type *T) {
-  return "mk." + rep->type(T);
+  return "mk_" + rep->type(T);
 }
 
 std::string VectorOperations::field(Type *T, unsigned idx) {
@@ -32,12 +32,41 @@ std::list<Decl *> VectorOperations::type(Type *T) {
   std::list<Decl *> decls;
 
   std::list<std::pair<std::string, std::string>> args;
-  for (unsigned i = 0; i < VT->getNumElements(); i++)
-    args.push_back({field(T, i), rep->type(VT->getElementType())});
+  std::list<Binding> quantifiedArgs;
+  std::list<const Expr *> constructorArgs;
+  std::list<const Expr *> selectorArgs;
+  auto vectorTy = rep->type(T);
+  auto elemTy = rep->type(VT->getElementType());
 
-  decls.push_back(Decl::typee(rep->type(T), "", {Attr::attr("datatype")}));
-  decls.push_back(Decl::function(constructor(T), args, rep->type(T), NULL,
-                                 {Attr::attr("constructor")}));
+  for (unsigned i = 0; i < VT->getNumElements(); i++) {
+    args.push_back({field(T, i), elemTy});
+
+    auto var = "x" + std::to_string(i);
+    quantifiedArgs.push_back({var, elemTy});
+    constructorArgs.push_back(Expr::id(var));
+    selectorArgs.push_back(Expr::fn(selector(T, i), Expr::id("v")));
+  }
+
+  decls.push_back(Decl::typee(vectorTy, ""));
+  decls.push_back(Decl::function(constructor(T), args, vectorTy));
+
+  for (unsigned i = 0; i < VT->getNumElements(); i++) {
+    decls.push_back(
+        Decl::function(selector(T, i), {{"v", vectorTy}}, elemTy));
+
+    auto projection =
+        Expr::eq(Expr::fn(selector(T, i),
+                          Expr::fn(constructor(T), constructorArgs)),
+                 Expr::id("x" + std::to_string(i)));
+    decls.push_back(Decl::axiom(
+        Expr::forall(quantifiedArgs, projection), selector(T, i) + ".ctor"));
+  }
+
+  decls.push_back(Decl::axiom(
+      Expr::forall({{"v", vectorTy}},
+                   Expr::eq(Expr::fn(constructor(T), selectorArgs),
+                            Expr::id("v"))),
+      constructor(T) + ".eta"));
 
   for (auto D : decls)
     rep->addAuxiliaryDeclaration(D);
@@ -173,7 +202,7 @@ FuncDecl *VectorOperations::shuffle(Type *T, Type *U, std::vector<int> mask) {
   FN << rep->opName(Naming::INSTRUCTION_TABLE.at(Instruction::ShuffleVector),
                     {T});
   for (auto m : mask)
-    FN << "." << m;
+    FN << "_m" << m;
 
   auto N = VT->getNumElements();
   std::list<const Expr *> args;

@@ -1,5 +1,7 @@
 use std::ptr;
 
+// @expect verified
+
 // Simplified from Qin et al. fig. 7
 
 unsafe fn run(data: *const u8) -> bool {

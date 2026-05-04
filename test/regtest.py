@@ -17,10 +17,11 @@ import shlex
 
 OVERRIDE_FIELDS = ['verifiers', 'memory', 'time-limit', 'memory-limit', 'skip']
 APPEND_FIELDS = ['flags', 'checkbpl', 'checkout']
+TEST_ROOT = path.dirname(path.realpath(__file__))
 
 LANGUAGES = {'c': {'*.c'},
              'cargo': {'Cargo.toml'},
-             'cplusplus': {'*.cpp'},
+             'cplusplus': {'*.cc', '*.cpp'},
              'rust': {'*.rs'},
              'llvm-ir': {"*.ll"}}
 
@@ -69,15 +70,29 @@ def merge(metadata, yamldata):
 
 def metadata(file):
     m = {}
+    root_config = path.join(TEST_ROOT, 'config.yml')
+    if path.isfile(root_config):
+        with open(root_config, "r") as f:
+            data = yaml.safe_load(f) or {}
+            merge(m, data)
+
+    rel_file = path.relpath(path.realpath(file), TEST_ROOT)
     prefix = []
 
-    for d in path.dirname(file).split('/'):
+    for d in path.dirname(rel_file).split(os.sep):
+        if d in ['', '.']:
+            continue
         prefix += [d]
-        yaml_file = path.join(*(prefix + ['config.yml']))
+        yaml_file = path.join(TEST_ROOT, *(prefix + ['config.yml']))
         if path.isfile(yaml_file):
             with open(yaml_file, "r") as f:
-                data = yaml.safe_load(f)
+                data = yaml.safe_load(f) or {}
                 merge(m, data)
+
+    for field in OVERRIDE_FIELDS:
+        m.setdefault(field, False if field == 'skip' else [])
+    for field in APPEND_FIELDS:
+        m.setdefault(field, [])
 
     with open(file, "r") as f:
         for line in f.readlines():
@@ -205,6 +220,8 @@ def get_extensions(languages):
     languages = list(languages.split(','))
     extensions = set()
     for language in languages:
+        if language not in LANGUAGES:
+            raise KeyError(language)
         extensions |= LANGUAGES[language]
     return extensions
 
@@ -212,8 +229,25 @@ def get_extensions(languages):
 def get_tests(folder, extensions):
     tests = []
     for ext in extensions:
-        tests_path = path.dirname(__file__)
-        tests.extend(glob.glob(path.join(tests_path, folder, ext)))
+        tests.extend(glob.glob(path.join(TEST_ROOT, folder, ext),
+                               recursive=True))
+
+    def nested_cargo_source(test):
+        if not test.endswith('.rs'):
+            return False
+
+        current = path.dirname(path.realpath(test))
+        while current.startswith(TEST_ROOT):
+            if path.isfile(path.join(current, 'Cargo.toml')):
+                return True
+            parent = path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+
+        return False
+
+    tests = [test for test in tests if not nested_cargo_source(test)]
     tests.sort()
     return tests
 
@@ -240,7 +274,7 @@ def main():
         "--all-examples",
         help="check all examples",
         action="store_true")
-    parser.add_argument("--folder", action="store", default="**/**", type=str,
+    parser.add_argument("--folder", action="store", default="**", type=str,
                         help="sets the regressions folder to run")
     parser.add_argument(
         "--threads",
@@ -264,11 +298,21 @@ def main():
         type=str,
         help="sets the output log path. (std out by default)")
     parser.add_argument(
+        "--output-dir",
+        action="store",
+        dest="output_dir",
+        default=path.join(TEST_ROOT, "output"),
+        type=str,
+        help="sets the directory for generated .bc and .bpl files")
+    parser.add_argument(
+        "--verifier",
+        action="store",
+        choices=["boogie", "corral", "symbooglix"],
+        help="force a verifier for all non-legacy tests")
+    parser.add_argument(
         "--languages",
         action="store",
         default="c",
-        choices=list(
-            LANGUAGES.keys()),
         help='''Comma separated list of langauges to test. C[c],C++[cplusplus],
                 Rust[rust]''')
     args = parser.parse_args()
@@ -277,7 +321,17 @@ def main():
         args.all_examples = True
         args.all_configs = True
 
-    extensions = get_extensions(args.languages)
+    args.output_dir = path.abspath(args.output_dir)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    global passed, failed, timeouts, unknowns
+    passed = failed = timeouts = unknowns = 0
+
+    try:
+        extensions = get_extensions(args.languages)
+    except KeyError as e:
+        parser.error("unknown language '%s' (choose from %s)" %
+                     (e.args[0], ', '.join(sorted(LANGUAGES.keys()))))
     tests = get_tests(args.folder, extensions)
 
     # configure the logging
@@ -323,20 +377,32 @@ def main():
             if meta['skip'] is not False and not args.all_examples:
                 continue
 
-            # build up the subprocess command
-            cmd = ['smack', test]
-            cmd += ['--time-limit', str(meta['time-limit'])]
-            cmd += meta['flags']
+            legacy_corral = set(meta['verifiers']) == {'corral'}
+            corral_enabled = os.environ.get('SMACK_ENABLE_CORRAL_TESTS') == '1'
+            if legacy_corral and args.verifier != 'corral' and not corral_enabled:
+                logging.info("Skipping legacy Corral-only test: %s", test)
+                continue
+
+            verifiers = [args.verifier] if args.verifier else meta['verifiers']
+
+            rel_test = path.relpath(test, TEST_ROOT)
+            test_output_dir = path.join(args.output_dir, path.dirname(rel_test))
+            os.makedirs(test_output_dir, exist_ok=True)
 
             for memory in meta['memory'][:100 if args.all_configs else 1]:
-                cmd += ['--mem-mod=' + memory]
-
-                for verifier in (meta['verifiers']
-                                     [:100 if args.all_configs else 1]):
+                for verifier in verifiers[:100 if args.all_configs else 1]:
                     name = path.splitext(path.basename(test))[0]
+                    cmd = ['smack', test]
+                    cmd += ['--time-limit', str(meta['time-limit'])]
+                    cmd += meta['flags']
+                    cmd += ['--mem-mod=' + memory]
                     cmd += ['--verifier=' + verifier]
-                    cmd += ['-bc', "%s-%s-%s.bc" % (name, memory, verifier)]
-                    cmd += ['-bpl', "%s-%s-%s.bpl" % (name, memory, verifier)]
+                    cmd += ['-bc', path.join(
+                        test_output_dir,
+                        "%s-%s-%s.bc" % (name, memory, verifier))]
+                    cmd += ['-bpl', path.join(
+                        test_output_dir,
+                        "%s-%s-%s.bpl" % (name, memory, verifier))]
                     r = p.apply_async(
                         process_test,
                         args=(

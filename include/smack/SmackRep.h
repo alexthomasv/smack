@@ -4,9 +4,9 @@
 #ifndef SMACKREP_H
 #define SMACKREP_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/IR/DataLayout.h"
-#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/Support/GraphWriter.h"
@@ -155,9 +155,8 @@ public:
 
   const Expr *ptrArith(const llvm::GetElementPtrInst *I);
   const Expr *ptrArith(const llvm::ConstantExpr *CE);
-  const Expr *
-  ptrArith(const llvm::Value *p,
-           std::vector<std::pair<llvm::Value *, llvm::gep_type_iterator>> args);
+  const Expr *ptrArith(const llvm::Value *p, llvm::Type *sourceElementType,
+                       llvm::ArrayRef<llvm::Value *> indices);
 
   const Expr *expr(const llvm::Value *v, bool isConstIntUnsigned = false,
                    bool isUnsignedInst = false);

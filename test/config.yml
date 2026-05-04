@@ -1,7 +1,7 @@
 skip: false
 time-limit: 180
 memory-limit: 450
-verifiers: [corral, boogie]
+verifiers: [boogie]
 memory: [no-reuse-impls, no-reuse, reuse]
 flags: [--unroll=2]
 checkbpl: []

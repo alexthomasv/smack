@@ -184,7 +184,7 @@ std::string SmackRep::intType(unsigned width) {
 
 std::string SmackRep::vectorType(int n, Type *T) {
   std::stringstream s;
-  s << Naming::VECTOR_TYPE << "." << n << "x" << type(T);
+  s << Naming::VECTOR_TYPE << "_" << n << "x" << type(T);
   return s.str();
 }
 
@@ -937,41 +937,77 @@ const Expr *SmackRep::lit(const llvm::Value *v, bool isUnsigned,
 }
 
 const Expr *SmackRep::ptrArith(const llvm::GetElementPtrInst *I) {
-  std::vector<std::pair<Value *, gep_type_iterator>> args;
-  gep_type_iterator T = gep_type_begin(I);
-  for (unsigned i = 1; i < I->getNumOperands(); i++, ++T)
-    args.push_back({I->getOperand(i), T});
-  return ptrArith(I->getPointerOperand(), args);
+  std::vector<Value *> indices;
+  for (unsigned i = 1; i < I->getNumOperands(); i++)
+    indices.push_back(I->getOperand(i));
+  return ptrArith(I->getPointerOperand(), I->getSourceElementType(), indices);
 }
 
 const Expr *SmackRep::ptrArith(const llvm::ConstantExpr *CE) {
   assert(CE->getOpcode() == Instruction::GetElementPtr);
-  std::vector<std::pair<Value *, gep_type_iterator>> args;
-  gep_type_iterator T = gep_type_begin(CE);
-  for (unsigned i = 1; i < CE->getNumOperands(); i++, ++T)
-    args.push_back({CE->getOperand(i), T});
-  return ptrArith(CE->getOperand(0), args);
+  std::vector<Value *> indices;
+  for (unsigned i = 1; i < CE->getNumOperands(); i++)
+    indices.push_back(CE->getOperand(i));
+  auto *GEP = llvm::cast<GEPOperator>(CE);
+  return ptrArith(CE->getOperand(0), GEP->getSourceElementType(), indices);
 }
 
-const Expr *SmackRep::ptrArith(
-    const llvm::Value *p,
-    std::vector<std::pair<llvm::Value *, llvm::gep_type_iterator>> args) {
+const Expr *SmackRep::ptrArith(const llvm::Value *p,
+                               llvm::Type *sourceElementType,
+                               llvm::ArrayRef<llvm::Value *> indices) {
   using namespace llvm;
 
   const Expr *e = expr(p);
 
-  for (auto a : args) {
+  enum class GepStateKind { Flat, StructOuter, VectorOuter };
 
-    if (StructType *st = a.second.getStructTypeOrNull()) {
-      assert(a.first->getType()->isIntegerTy() &&
-             a.first->getType()->getPrimitiveSizeInBits() == 32 &&
-             "Illegal struct index");
-      unsigned fieldNo = dyn_cast<ConstantInt>(a.first)->getZExtValue();
-      e = pa(e, offset(st, fieldNo), 1);
+  Type *indexedType = sourceElementType;
+  GepStateKind state = GepStateKind::Flat;
+
+  auto advance = [&](Type *next) {
+    if (auto *AT = dyn_cast_or_null<ArrayType>(next)) {
+      indexedType = AT->getElementType();
+      state = GepStateKind::Flat;
+    } else if (auto *VT = dyn_cast_or_null<VectorType>(next)) {
+      indexedType = VT;
+      state = GepStateKind::VectorOuter;
+    } else if (auto *ST = dyn_cast_or_null<StructType>(next)) {
+      indexedType = ST;
+      state = GepStateKind::StructOuter;
     } else {
-      Type *et = a.second.getIndexedType();
-      assert(a.first->getType()->isIntegerTy() && "Illegal index");
-      if (const ConstantInt *ci = dyn_cast<ConstantInt>(a.first)) {
+      indexedType = nullptr;
+      state = GepStateKind::Flat;
+    }
+  };
+
+  for (auto *index : indices) {
+    if (state == GepStateKind::StructOuter) {
+      auto *st = llvm::cast<StructType>(indexedType);
+      auto *ci = dyn_cast<ConstantInt>(index);
+      if (!ci || !st->indexValid(ci)) {
+        advance(nullptr);
+        continue;
+      }
+
+      unsigned fieldNo = ci->getZExtValue();
+      e = pa(e, offset(st, fieldNo), 1);
+      advance(st->getElementType(fieldNo));
+    } else {
+      Type *et = indexedType;
+      if (state == GepStateKind::VectorOuter)
+        et = llvm::cast<VectorType>(indexedType)->getElementType();
+
+      if (!et || !et->isSized()) {
+        advance(nullptr);
+        continue;
+      }
+
+      if (!index->getType()->isIntegerTy()) {
+        advance(et);
+        continue;
+      }
+
+      if (const ConstantInt *ci = dyn_cast<ConstantInt>(index)) {
         // First check if the result of multiplication fits in 64 bits
         const APInt &idx = ci->getValue();
         APInt size(idx.getBitWidth(), storageSize(et));
@@ -981,9 +1017,11 @@ const Expr *SmackRep::ptrArith(
         e = pa(e, (long long)ci->getSExtValue(), storageSize(et));
       } else
         e = pa(e,
-               integerToPointer(expr(a.first),
-                                a.first->getType()->getIntegerBitWidth()),
+               integerToPointer(expr(index),
+                                index->getType()->getIntegerBitWidth()),
                storageSize(et));
+
+      advance(et);
     }
   }
 

@@ -92,9 +92,26 @@ static void simplifyGEP(GetElementPtrInst *GEP) {
 
     // Find out whether the last index in the source GEP is a sequential idx.
     bool EndsWithSequential = false;
-    for (gep_type_iterator I = gep_type_begin(*Src), E = gep_type_end(*Src);
-         I != E; ++I)
-      EndsWithSequential = !I.isStruct();
+    Type *IndexedTy = Src->getSourceElementType();
+    for (auto I = Src->idx_begin(), E = Src->idx_end(); I != E; ++I) {
+      if (!IndexedTy)
+        return;
+
+      if (auto *STy = dyn_cast<StructType>(IndexedTy)) {
+        EndsWithSequential = false;
+        if (!STy->indexValid(*I))
+          return;
+        IndexedTy = STy->getTypeAtIndex(*I);
+      } else {
+        EndsWithSequential = true;
+        if (auto *ATy = dyn_cast<ArrayType>(IndexedTy))
+          IndexedTy = ATy->getElementType();
+        else if (auto *VTy = dyn_cast<VectorType>(IndexedTy))
+          IndexedTy = VTy->getElementType();
+        else
+          IndexedTy = nullptr;
+      }
+    }
 
     // Can we combine the two pointer arithmetics offsets?
     if (EndsWithSequential) {

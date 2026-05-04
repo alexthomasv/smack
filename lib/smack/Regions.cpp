@@ -141,6 +141,7 @@ void Regions::getAnalysisUsage(llvm::AnalysisUsage &AU) const {
 }
 
 bool Regions::runOnModule(Module &M) {
+  finalized = false;
   // Shaobo: my understanding of how this class works:
   // First, a bunch of instructions involving pointers are visited (via
   // Regions::idx). During a visit on an instruction, a region is created
@@ -160,6 +161,7 @@ bool Regions::runOnModule(Module &M) {
     visit(M);
   }
 
+  finalized = true;
   return false;
 }
 
@@ -218,6 +220,21 @@ unsigned Regions::idx(Region &R) {
   SDEBUG(errs() << "[regions]   using region: ");
   SDEBUG(R.print(errs()));
   SDEBUG(errs() << "\n");
+
+  if (finalized) {
+    for (r = 0; r < regions.size(); ++r) {
+      if (regions[r].overlaps(R)) {
+        SDEBUG(errs() << "[regions]   found finalized overlap at index " << r
+                      << "\n\n");
+        return r;
+      }
+    }
+
+    regions.emplace_back(R);
+    SDEBUG(errs() << "[regions]   appended finalized region at index " << r
+                  << "\n\n");
+    return r;
+  }
 
   for (r = 0; r < regions.size(); ++r) {
     if (regions[r].overlaps(R)) {

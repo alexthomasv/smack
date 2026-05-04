@@ -1,5 +1,6 @@
 use std::alloc::{alloc, dealloc, Layout};
 
+// @flag --check=memory-safety
 // @expect error
 
 fn main() {

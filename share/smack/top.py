@@ -459,6 +459,31 @@ def arguments():
         help='write source/Boogie impact and provenance report to FILE')
 
     translate_group.add_argument(
+        '--diff-product-alignment',
+        choices=['corerel', 'legacy', 'baseline'],
+        default='corerel',
+        help='select diff-product alignment strategy [default: %(default)s]')
+
+    translate_group.add_argument(
+        '--diff-product-no-egraph',
+        action='store_true',
+        default=False,
+        help='disable e-graph optimization in --diff-product')
+
+    translate_group.add_argument(
+        '--diff-product-egraph-timeout',
+        metavar='N',
+        default=10,
+        type=int,
+        help='e-graph timeout for --diff-product, in seconds [default: %(default)s]')
+
+    translate_group.add_argument(
+        '--diff-product-require-actual',
+        action='store_true',
+        default=False,
+        help='fail if --diff-product can only emit metadata fallback')
+
+    translate_group.add_argument(
         '--rewrite-bitwise-ops',
         action="store_true",
         default=False,
@@ -987,7 +1012,8 @@ def verification_result(verifier_output, verifier):
         elif verifier == 'boogie':
             boogie_af_msg = re.search(
                 r'([\w#$~%.\/-]+)\((\d+),\d+\): '
-                r'Error: This assertion might not hold', verifier_output)
+                r'Error: (This assertion might not hold|'
+                r'this assertion could not be proved)', verifier_output)
             if boogie_af_msg:
                 if re.match('.*[.]bpl$', boogie_af_msg.group(1)):
                     line_no = int(boogie_af_msg.group(2))
@@ -1014,8 +1040,7 @@ def verification_result(verifier_output, verifier):
 
 def boogie_command(args):
     command = ["boogie"]
-    command += ["/doModSetAnalysis"]
-    command += ["/useArrayTheory"]
+    command += ["/inferModifies"]
     command += ["/timeLimit:%s" % args.time_limit]
     command += ["/errorLimit:%s" % args.max_violations]
     if not args.modular:
@@ -1236,6 +1261,9 @@ def run_diff_product(args):
             right_name=args.diff_right,
             left_entry=args.diff_left_entry,
             right_entry=args.diff_right_entry,
+            alignment=args.diff_product_alignment,
+            no_egraph=args.diff_product_no_egraph,
+            egraph_timeout_s=args.diff_product_egraph_timeout,
         )
 
     with open(args.diff_product_out, 'w') as f:
@@ -1251,6 +1279,12 @@ def run_diff_product(args):
         print("SMACK generated %s" % args.diff_product_out)
         if report_file:
             print("SMACK generated %s" % report_file)
+
+    if args.diff_product_require_actual and not result.product.actual_product_available:
+        exit_with_error(
+            "--diff-product-require-actual was set, but only metadata "
+            "fallback was available"
+        )
 
 
 def diff_product_side_args(args, input_file, entry_point, tmp_dir, side):
@@ -1268,6 +1302,7 @@ def diff_product_side_args(args, input_file, entry_point, tmp_dir, side):
     side_args.diff_right = None
     side_args.diff_product_out = None
     side_args.diff_product_json = None
+    side_args.diff_product_require_actual = False
     return side_args
 
 

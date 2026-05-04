@@ -4,7 +4,15 @@
 #ifndef SMACK_H_
 #define SMACK_H_
 #include <limits.h>
+#ifndef SMACK_NO_STDDEF
 #include <stddef.h>
+#endif
+
+#ifdef __SIZE_TYPE__
+typedef __SIZE_TYPE__ __smack_size_t;
+#else
+typedef unsigned long __smack_size_t;
+#endif
 
 /**
  * The SMACK "prelude" declarations
@@ -35,15 +43,18 @@ void __SMACK_decl(const char *fmt, ...);
 
 // Structured loop invariant intrinsics. SMACK generates Boogie natively.
 // No format strings or @ substitution needed. MEM resolution is automatic.
-void __SMACK_inv_byte_copy_fwd(size_t free_var, void *dst, void *src,
-                                size_t loop_var, size_t count);
-void __SMACK_inv_byte_copy_bwd(size_t free_var, void *dst, void *src,
-                                size_t loop_var, size_t count);
-void __SMACK_inv_bounds(size_t var, size_t upper);
-void __SMACK_inv_ptr_progress(void *ptr, void *base, size_t total,
-                               size_t remaining, size_t stride);
-void __SMACK_inv_buffer(void *ptr, void *ptr_init, size_t len,
-                         size_t len_init);
+void __SMACK_inv_byte_copy_fwd(__smack_size_t free_var, void *dst, void *src,
+                                __smack_size_t loop_var,
+                                __smack_size_t count);
+void __SMACK_inv_byte_copy_bwd(__smack_size_t free_var, void *dst, void *src,
+                                __smack_size_t loop_var,
+                                __smack_size_t count);
+void __SMACK_inv_bounds(__smack_size_t var, __smack_size_t upper);
+void __SMACK_inv_ptr_progress(void *ptr, void *base, __smack_size_t total,
+                               __smack_size_t remaining,
+                               __smack_size_t stride);
+void __SMACK_inv_buffer(void *ptr, void *ptr_init, __smack_size_t len,
+                         __smack_size_t len_init);
 void __SMACK_top_decl(const char *fmt, ...);
 
 typedef struct smack_value {

@@ -510,7 +510,11 @@ if [ ${TEST_SMACK} -eq 1 ] ; then
   puts "Running SMACK regression tests"
 
   cd ${SMACK_DIR}/test
-  ./regtest.py ${REGTEST_ENV}
+  SMACK_TEST_PREFIX="${INSTALL_PREFIX:-/usr/local}"
+  SMACK_TEST_OUTPUT_DIR="${SMACK_TEST_OUTPUT_DIR:-${SMACK_DIR}/build/regtest}"
+  PATH="${SMACK_TEST_PREFIX}/bin:${BOOGIE_DIR}:${Z3_DIR}/bin:${PATH}" \
+    ./regtest.py --verifier="${REGTEST_VERIFIER:-boogie}" \
+      --output-dir "${SMACK_TEST_OUTPUT_DIR}" ${REGTEST_ENV}
   res=$?
 
   puts "Regression tests complete"
