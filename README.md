@@ -1,6 +1,10 @@
 [![main branch ci status](https://github.com/smackers/smack/workflows/SMACK%20CI/badge.svg?branch=main)](https://github.com/smackers/smack/actions)
 [![develop branch ci status](https://github.com/smackers/smack/workflows/SMACK%20CI/badge.svg?branch=develop)](https://github.com/smackers/smack/actions)
 
+> Fork notice: this repository is Alex Thomas's Swoosh-oriented fork of
+> [SMACK](https://github.com/smackers/smack). The upstream SMACK project,
+> license, acknowledgements, and documentation are preserved below.
+
 <img src="docs/smack-logo.png" width=400 alt="SMACK Logo" align="right">
 
 SMACK is both a *modular software verification toolchain* and a
@@ -61,4 +65,3 @@ benchmarking of SMACK.
 1. [Projects](docs/projects.md)
 1. [Publications](docs/publications.md)
 1. [People](docs/people.md)
-
