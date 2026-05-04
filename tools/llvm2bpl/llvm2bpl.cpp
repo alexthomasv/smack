@@ -36,6 +36,7 @@
 #include "smack/IntegerOverflowChecker.h"
 #include "smack/MemorySafetyChecker.h"
 #include "smack/Naming.h"
+#include "smack/InitUndefAllocas.h"
 #include "smack/NormalizeLoops.h"
 #include "smack/RemoveDeadDefs.h"
 #include "smack/RewriteBitwiseOps.h"
@@ -181,6 +182,7 @@ int main(int argc, char **argv) {
     pass_manager.add(new smack::RemoveDeadDefs());
   }
 
+  pass_manager.add(new smack::InitUndefAllocas());
   pass_manager.add(seadsa::createRemovePtrToIntPass());
   pass_manager.add(llvm::createLowerSwitchPass());
   // pass_manager.add(llvm::createCFGSimplificationPass());
