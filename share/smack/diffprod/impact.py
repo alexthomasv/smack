@@ -140,9 +140,35 @@ def analyze_side_impact(
                 )
                 mark_block(impact, prov, block_id, "contains-diff-stmt", via=stmt_id)
 
-    close_cfg(parsed, impact)
-    close_data_deps(parsed, impact)
+    close_impact_fixpoint(parsed, impact)
     return impact
+
+
+def close_impact_fixpoint(parsed: ParsedBoogieProgram, impact: SideImpact) -> None:
+    """Close source/LLVM seeds through semantic dependencies.
+
+    Textual diffs are only seeds. A changed value can affect a later unchanged
+    branch, call argument, load address, or return; conversely, unrelated blocks
+    between two independent diffs should not be pulled into the delta merely
+    because they are between the hunks in CFG order. Iterate data and control
+    closure to a fixpoint so newly impacted branch blocks can pull in their CFG
+    successors, and newly pulled blocks can expose more data dependencies.
+    """
+
+    changed = True
+    while changed:
+        before = impact_snapshot(impact)
+        close_data_deps(parsed, impact)
+        close_cfg(parsed, impact)
+        changed = impact_snapshot(impact) != before
+
+
+def impact_snapshot(impact: SideImpact) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    return (
+        frozenset(impact.impacted_blocks),
+        frozenset(impact.impacted_statements),
+        frozenset(impact.variables),
+    )
 
 
 def mark_block(
@@ -176,18 +202,23 @@ def close_cfg(parsed: ParsedBoogieProgram, impact: SideImpact) -> None:
         if not seed_labels:
             continue
 
-        between = blocks_between(cfg, seed_labels)
-        adjacent = set(seed_labels)
+        labels_to_mark: dict[str, str] = {}
         for label in seed_labels:
-            adjacent.update(cfg.get(label, set()))
             for pred, succs in cfg.items():
                 if label in succs and len(succs) > 1:
-                    adjacent.add(pred)
+                    labels_to_mark.setdefault(pred, "cfg-closure")
+            if len(cfg.get(label, set())) > 1:
+                for controlled in reachable_forward(cfg, {label}):
+                    if controlled != label:
+                        labels_to_mark[controlled] = "control-dependency"
 
-        for label in between | adjacent:
+        for label, reason in labels_to_mark.items():
             block_id = label_to_block_id.get(label)
-            if block_id is not None and block_id not in impact.impacted_blocks:
-                mark_block(impact, prov, block_id, "cfg-closure")
+            if block_id is not None:
+                if block_id not in impact.impacted_blocks:
+                    mark_block(impact, prov, block_id, reason)
+                else:
+                    impact.add_reason(ImpactReason(node_id=block_id, reason=reason))
 
 
 def cfg_for_proc(proc: Any) -> dict[str, set[str]]:
@@ -202,12 +233,6 @@ def cfg_for_proc(proc: Any) -> dict[str, set[str]]:
     return cfg
 
 
-def blocks_between(cfg: dict[str, set[str]], seeds: set[str]) -> set[str]:
-    if not seeds:
-        return set()
-    return reachable_forward(cfg, seeds) & reachable_backward(cfg, seeds)
-
-
 def reachable_forward(cfg: dict[str, set[str]], seeds: set[str]) -> set[str]:
     seen = set(seeds)
     work = list(seeds)
@@ -220,44 +245,43 @@ def reachable_forward(cfg: dict[str, set[str]], seeds: set[str]) -> set[str]:
     return seen
 
 
-def reachable_backward(cfg: dict[str, set[str]], seeds: set[str]) -> set[str]:
-    pred: dict[str, set[str]] = {label: set() for label in cfg}
-    for label, succs in cfg.items():
-        for succ in succs:
-            pred.setdefault(succ, set()).add(label)
-    seen = set(seeds)
-    work = list(seeds)
-    while work:
-        cur = work.pop()
-        for predecessor in pred.get(cur, set()):
-            if predecessor not in seen:
-                seen.add(predecessor)
-                work.append(predecessor)
-    return seen
-
-
 def close_data_deps(parsed: ParsedBoogieProgram, impact: SideImpact) -> None:
     prov = parsed.provenance
-    variables = set(impact.variables)
-    for stmt_id in list(impact.impacted_statements):
-        stmt = prov.nodes.get(stmt_id)
-        if stmt is not None:
-            variables.update(stmt_defs(stmt))
-            variables.update(stmt_uses(stmt))
+    variables_by_proc: dict[str, set[str]] = {}
 
     changed = True
     while changed:
         changed = False
+        before_vars = {
+            proc_id: frozenset(variables)
+            for proc_id, variables in variables_by_proc.items()
+        }
+        for stmt_id in list(impact.impacted_statements):
+            stmt = prov.nodes.get(stmt_id)
+            block_id = prov.stmt_to_block.get(stmt_id)
+            proc_id = prov.block_to_proc.get(block_id or "")
+            if stmt is not None and proc_id is not None:
+                variables = variables_by_proc.setdefault(proc_id, set())
+                variables.update(stmt_defs(stmt))
+                variables.update(stmt_uses(stmt))
+        after_vars = {
+            proc_id: frozenset(variables)
+            for proc_id, variables in variables_by_proc.items()
+        }
+        changed = changed or after_vars != before_vars
+
         for stmt_id, kind in prov.node_kinds.items():
             if kind != "stmt" or stmt_id in impact.impacted_statements:
                 continue
             stmt = prov.nodes[stmt_id]
             defs = stmt_defs(stmt)
             uses = stmt_uses(stmt)
+            block_id = prov.stmt_to_block[stmt_id]
+            proc_id = prov.block_to_proc.get(block_id)
+            variables = variables_by_proc.setdefault(proc_id or "", set())
             overlap = variables & (defs | uses)
             if not overlap:
                 continue
-            block_id = prov.stmt_to_block[stmt_id]
             impact.impacted_statements.add(stmt_id)
             mark_block(impact, prov, block_id, "data-dependency", via=stmt_id)
             for var in sorted(overlap):
@@ -272,7 +296,8 @@ def close_data_deps(parsed: ParsedBoogieProgram, impact: SideImpact) -> None:
             variables.update(defs)
             variables.update(uses)
             changed = changed or variables != before
-    impact.variables.update(variables)
+    for variables in variables_by_proc.values():
+        impact.variables.update(variables)
 
 
 def stmt_defs(stmt: Any) -> set[str]:

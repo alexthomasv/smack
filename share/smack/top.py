@@ -415,6 +415,79 @@ def arguments():
         help='build a diff-scoped product artifact from two source inputs')
 
     translate_group.add_argument(
+        '--product-mode',
+        choices=['functions', 'patch'],
+        default=None,
+        help='easy diff-product interface: functions=two sources, patch=source plus diff')
+
+    translate_group.add_argument(
+        '--left',
+        metavar='FILE',
+        default=None,
+        action=FileAction,
+        type=str,
+        help='left source input for --product-mode functions')
+
+    translate_group.add_argument(
+        '--right',
+        metavar='FILE',
+        default=None,
+        action=FileAction,
+        type=str,
+        help='right source input for --product-mode functions')
+
+    translate_group.add_argument(
+        '--source',
+        metavar='FILE',
+        default=None,
+        action=FileAction,
+        type=str,
+        help='source input for --product-mode patch')
+
+    translate_group.add_argument(
+        '--patch',
+        metavar='FILE',
+        default=None,
+        action=FileAction,
+        type=str,
+        help='unified diff input for --product-mode patch')
+
+    translate_group.add_argument(
+        '--entry',
+        metavar='PROC',
+        default=None,
+        type=str,
+        help='entry procedure for both product sides')
+
+    translate_group.add_argument(
+        '--left-entry',
+        metavar='PROC',
+        default=None,
+        type=str,
+        help='left entry procedure for product mode')
+
+    translate_group.add_argument(
+        '--right-entry',
+        metavar='PROC',
+        default=None,
+        type=str,
+        help='right entry procedure for product mode')
+
+    translate_group.add_argument(
+        '--product-out',
+        metavar='FILE',
+        default=None,
+        type=str,
+        help='write the product Boogie artifact to FILE')
+
+    translate_group.add_argument(
+        '--product-json',
+        metavar='FILE',
+        default=None,
+        type=str,
+        help='write product provenance/e-graph report to FILE')
+
+    translate_group.add_argument(
         '--diff-left',
         metavar='FILE',
         default=None,
@@ -459,9 +532,22 @@ def arguments():
         help='write source/Boogie impact and provenance report to FILE')
 
     translate_group.add_argument(
+        '--diff-product-match-json',
+        metavar='FILE',
+        default=None,
+        type=str,
+        help='write LLVM structural matcher report to FILE')
+
+    translate_group.add_argument(
+        '--diff-product-dump-llvm',
+        action='store_true',
+        default=False,
+        help='dump normalized left/right LLVM IR while building --diff-product')
+
+    translate_group.add_argument(
         '--diff-product-alignment',
-        choices=['corerel', 'legacy', 'baseline'],
-        default='corerel',
+        choices=['auto', 'corerel', 'legacy', 'baseline'],
+        default='auto',
         help='select diff-product alignment strategy [default: %(default)s]')
 
     translate_group.add_argument(
@@ -482,6 +568,12 @@ def arguments():
         action='store_true',
         default=False,
         help='fail if --diff-product can only emit metadata fallback')
+
+    translate_group.add_argument(
+        '--diff-product-verify',
+        action='store_true',
+        default=False,
+        help='run the selected diff-product through the configured verifier')
 
     translate_group.add_argument(
         '--rewrite-bitwise-ops',
@@ -726,8 +818,40 @@ def arguments():
 
     explicit_bpl_file = args.bpl_file is not None
 
-    if args.diff_product:
-        if not args.diff_left or not args.diff_right:
+    if args.product_out and args.diff_product_out is None:
+        args.diff_product_out = args.product_out
+    if args.product_json and args.diff_product_json is None:
+        args.diff_product_json = args.product_json
+
+    if args.product_mode == 'functions':
+        if not args.left or not args.right:
+            parser.error('--product-mode functions requires --left and --right')
+        args.diff_product_mode = 'functions'
+        args.diff_left = args.left
+        args.diff_right = args.right
+        left_entry = args.left_entry or args.entry or args.diff_left_entry
+        right_entry = args.right_entry or args.entry or args.diff_right_entry
+        args.diff_left_entry = left_entry
+        args.diff_right_entry = right_entry or left_entry
+    elif args.product_mode == 'patch':
+        if not args.source or not args.patch:
+            parser.error('--product-mode patch requires --source and --patch')
+        args.diff_product_mode = 'patch'
+        args.diff_product = args.patch
+        args.diff_left = args.source
+        left_entry = args.left_entry or args.entry or args.diff_left_entry
+        right_entry = args.right_entry or args.entry or args.diff_right_entry
+        args.diff_left_entry = left_entry
+        args.diff_right_entry = right_entry or left_entry
+    elif args.diff_product:
+        args.diff_product_mode = 'patch-with-right'
+    else:
+        args.diff_product_mode = None
+
+    if args.diff_product_mode:
+        if args.diff_product_mode == 'patch-with-right' and (
+            not args.diff_left or not args.diff_right
+        ):
             parser.error('--diff-product requires --diff-left and --diff-right')
         if args.diff_right_entry is None:
             args.diff_right_entry = args.diff_left_entry
@@ -739,7 +863,7 @@ def arguments():
             args.bpl_file = args.diff_product_out
         args.no_verify = True
     elif not args.input_files:
-        parser.error('input-files are required unless --diff-product is used')
+        parser.error('input-files are required unless product mode is used')
 
     if not args.bc_file:
         args.bc_file = temporary_file('a', '.bc', args)
@@ -834,7 +958,7 @@ def llvm_to_bpl(args):
     if sys.stdout.isatty():
         cmd += ['-colored-warnings']
     cmd += ['-source-loc-syms']
-    if args.provenance_syms or args.diff_product:
+    if args.provenance_syms or getattr(args, 'diff_product_mode', None):
         cmd += ['-provenance-syms']
     for ep in args.entry_points:
         cmd += ['-entry-points', ep]
@@ -1232,42 +1356,100 @@ def verify_bpl_portfolio(args):
 def run_diff_product(args):
     """Run both source versions through SMACK and build the diff product."""
 
-    from .diffprod.pipeline import build_from_bpl
-
-    with open(args.diff_product, 'r') as f:
-        diff_text = f.read()
+    from .diffprod.failure_cut import failure_cut_from_text
+    from .diffprod.pipeline import EquivalenceCheck, build_from_bpl
 
     with tempfile.TemporaryDirectory(prefix='smack-diff-product-') as tmp_dir:
+        mode = getattr(args, 'diff_product_mode', None) or 'patch-with-right'
+        diff_text = ''
+        right_input = args.diff_right
+        right_name = args.diff_right
+
+        if mode in ('patch', 'patch-with-right'):
+            with open(args.diff_product, 'r') as f:
+                diff_text = f.read()
+
+        if mode == 'patch':
+            from diffprod.user_api import apply_unified_diff_to_text
+
+            with open(args.diff_left, 'r') as f:
+                left_source_text = f.read()
+            patched_source_text = apply_unified_diff_to_text(
+                left_source_text, diff_text)
+            right_input = os.path.join(
+                tmp_dir,
+                diff_product_patched_filename(diff_text, args.diff_left),
+            )
+            with open(right_input, 'w') as f:
+                f.write(patched_source_text)
+            right_name = "%s (patched)" % args.diff_left
+
         left_args = diff_product_side_args(
             args, args.diff_left, args.diff_left_entry, tmp_dir, 'left')
         right_args = diff_product_side_args(
-            args, args.diff_right, args.diff_right_entry, tmp_dir, 'right')
+            args, right_input, args.diff_right_entry, tmp_dir, 'right')
 
         target_selection(left_args)
         frontend(left_args)
         target_selection(right_args)
         frontend(right_args)
 
-        with open(left_args.bpl_file, 'r') as f:
-            left_bpl = f.read()
-        with open(right_args.bpl_file, 'r') as f:
-            right_bpl = f.read()
+        lowering = run_paired_diff_product_lowering(
+            args, left_args, right_args, tmp_dir)
+        lowering_diagnostics = lowering.get('diagnostics', [])
+
+        if lowering.get('ok'):
+            left_bpl = lowering['left_bpl']
+            right_bpl = lowering['right_bpl']
+            llvm_match = lowering.get('llvm_match')
+        else:
+            exit_with_error(
+                "the required SMACK C++ LLVM matcher could not run: %s. "
+                "Build and install SMACK with LLVM 22, then ensure "
+                "`llvm-diffmatch2bpl` is on PATH" %
+                "; ".join(lowering_diagnostics)
+            )
+
+        if args.diff_product_match_json and llvm_match is not None:
+            with open(args.diff_product_match_json, 'w') as f:
+                json.dump(llvm_match, f, indent=2, sort_keys=True)
+                f.write('\n')
 
         result = build_from_bpl(
             left_bpl=left_bpl,
             right_bpl=right_bpl,
             diff_text=diff_text,
             left_name=args.diff_left,
-            right_name=args.diff_right,
+            right_name=right_name,
             left_entry=args.diff_left_entry,
             right_entry=args.diff_right_entry,
             alignment=args.diff_product_alignment,
             no_egraph=args.diff_product_no_egraph,
             egraph_timeout_s=args.diff_product_egraph_timeout,
+            llvm_match=llvm_match,
         )
+        result.diagnostics = [
+            "interface mode: %s" % (
+                'patch' if mode in ('patch', 'patch-with-right') else 'functions'
+            ),
+            *lowering_diagnostics,
+            *result.diagnostics,
+        ]
 
     with open(args.diff_product_out, 'w') as f:
         f.write(result.product.text)
+
+    if args.diff_product_verify:
+        verifier_output, verifier_result = verify_diff_product(args)
+        result.equivalence = EquivalenceCheck(
+            checked=True,
+            verified=verifier_result is VResult.VERIFIED,
+            result=str(verifier_result),
+            return_code=verifier_result.return_code(),
+            output_tail=verifier_output[-4000:],
+        )
+        result.failure_cut = failure_cut_from_text(
+            result.left, result.right, verifier_output)
 
     report_file = args.diff_product_json or args.json_file
     if report_file:
@@ -1287,6 +1469,151 @@ def run_diff_product(args):
         )
 
 
+def run_paired_diff_product_lowering(args, left_args, right_args, tmp_dir):
+    """Run the paired SMACK LLVM matcher/lowerer when it is available."""
+
+    match_file = os.path.join(tmp_dir, 'llvm-match.json')
+    cmd = [
+        'llvm-diffmatch2bpl',
+        '--left-bc', left_args.linked_bc_file,
+        '--right-bc', right_args.linked_bc_file,
+        '--left-entry', args.diff_left_entry,
+        '--right-entry', args.diff_right_entry,
+        '--left-bpl', left_args.bpl_file,
+        '--right-bpl', right_args.bpl_file,
+        '--match-json', match_file,
+    ]
+    if args.diff_product_dump_llvm:
+        cmd += ['--left-ll', left_args.ll_file]
+        cmd += ['--right-ll', right_args.ll_file]
+    cmd += llvm_to_bpl_option_args(args, [args.diff_left_entry, args.diff_right_entry])
+
+    if args.debug:
+        print("Running %s" % " ".join(cmd))
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    except OSError as err:
+        return {
+            'ok': False,
+            'diagnostics': [
+                "SMACK C++ LLVM matcher unavailable: %s" % err,
+            ],
+        }
+
+    if completed.returncode != 0:
+        tail = completed.stdout[-1200:].strip()
+        return {
+            'ok': False,
+            'diagnostics': [
+                "SMACK C++ LLVM matcher failed with exit code %s%s" % (
+                    completed.returncode,
+                    (": %s" % tail) if tail else "",
+                ),
+            ],
+        }
+
+    for side_args in (left_args, right_args):
+        annotate_bpl(side_args)
+        memsafety_subproperty_selection(side_args)
+        replace_reach_error(side_args)
+        transform_bpl(side_args)
+
+    with open(left_args.bpl_file, 'r') as f:
+        left_bpl = f.read()
+    with open(right_args.bpl_file, 'r') as f:
+        right_bpl = f.read()
+    with open(match_file, 'r') as f:
+        llvm_match = json.load(f)
+
+    return {
+        'ok': True,
+        'left_bpl': left_bpl,
+        'right_bpl': right_bpl,
+        'llvm_match': llvm_match,
+        'diagnostics': ["LLVM matcher source: smack-cpp"],
+    }
+
+
+def llvm_to_bpl_option_args(args, entry_points):
+    """Build the llvm2bpl-compatible options shared by product lowerers."""
+
+    cmd = ['-warn-type', args.warn]
+    cmd += ['-sea-dsa=ci']
+    if sys.stdout.isatty():
+        cmd += ['-colored-warnings']
+    cmd += ['-source-loc-syms']
+    cmd += ['-provenance-syms']
+    seen = set()
+    for ep in entry_points:
+        if ep and ep not in seen:
+            cmd += ['-entry-points', ep]
+            seen.add(ep)
+    for cf in args.checked_functions:
+        cmd += ['-checked-functions', cf]
+    if args.debug:
+        cmd += ['-debug']
+    if args.debug_only:
+        cmd += ['-debug-only', args.debug_only]
+    if "impls" in args.mem_mod:
+        cmd += ['-mem-mod-impls']
+    if args.static_unroll:
+        cmd += ['-static-unroll']
+    if args.integer_encoding == 'bit-vector':
+        cmd += ['-bit-precise']
+    if args.integer_encoding == 'wrapped-integer':
+        cmd += ['-wrapped-integer-encoding']
+    if args.timing_annotations:
+        cmd += ['-timing-annotations']
+    if args.pointer_encoding == 'bit-vector':
+        cmd += ['-bit-precise-pointers']
+    if args.no_byte_access_inference:
+        cmd += ['-no-byte-access-inference']
+    if args.rewrite_bitwise_ops:
+        cmd += ['-rewrite-bitwise-ops']
+    if args.no_memory_splitting:
+        cmd += ['-no-memory-splitting']
+    if args.check.contains_mem_safe_props():
+        cmd += ['-memory-safety']
+    if VProperty.INTEGER_OVERFLOW in args.check:
+        cmd += ['-integer-overflow']
+    if VProperty.RUST_PANICS in args.check:
+        cmd += ['-rust-panics']
+    if args.fail_on_loop_exit:
+        cmd += ['-fail-on-loop-exit']
+    if args.llvm_assumes:
+        cmd += ['-llvm-assumes=' + args.llvm_assumes]
+    if args.float:
+        cmd += ['-float']
+    if args.modular:
+        cmd += ['-modular']
+    return cmd
+
+
+def diff_product_patched_filename(diff_text, fallback_source):
+    """Choose a temp filename that matches the diff's right-side source path."""
+
+    for line in diff_text.splitlines():
+        if not line.startswith('+++ '):
+            continue
+        path = line[4:].split('\t', 1)[0].strip()
+        if path == '/dev/null':
+            break
+        if path.startswith('a/') or path.startswith('b/'):
+            path = path[2:]
+        basename = os.path.basename(path)
+        if basename:
+            return basename
+    _, ext = os.path.splitext(fallback_source)
+    return "right%s" % (ext or ".c")
+
+
 def diff_product_side_args(args, input_file, entry_point, tmp_dir, side):
     side_args = copy.copy(args)
     side_args.input_files = [input_file]
@@ -1303,7 +1630,45 @@ def diff_product_side_args(args, input_file, entry_point, tmp_dir, side):
     side_args.diff_product_out = None
     side_args.diff_product_json = None
     side_args.diff_product_require_actual = False
+    side_args.diff_product_verify = False
+    side_args.skip_llvm_to_bpl = True
     return side_args
+
+
+def verify_diff_product(args):
+    """Run the selected diff-product Boogie file and return raw verifier output."""
+
+    verify_args = copy.copy(args)
+    verify_args.bpl_file = args.diff_product_out
+    verify_args.json_file = None
+    verify_args.error_file = None
+    verify_args.replay = None
+
+    if verify_args.verifier == 'boogie' or verify_args.modular:
+        command = boogie_command(verify_args)
+        command += ["/proverOpt:O:smt.array.extensional=false"]
+        command += ["/proverOpt:O:smt.qi.eager_threshold=100"]
+        command += ["/proverOpt:O:smt.arith.solver=2"]
+        if verify_args.verifier_options:
+            command += verify_args.verifier_options.split()
+        command += [verify_args.bpl_file]
+    elif verify_args.verifier == 'corral':
+        command = corral_command(verify_args)
+        command += ["/bopt:proverOpt:O:smt.qi.eager_threshold=100"]
+        command += ["/bopt:proverOpt:O:smt.arith.solver=2"]
+        if verify_args.verifier_options:
+            command += verify_args.verifier_options.split()
+    elif verify_args.verifier == 'symbooglix':
+        command = symbooglix_command(verify_args)
+        if verify_args.verifier_options:
+            command += verify_args.verifier_options.split()
+    else:
+        exit_with_error(
+            "--diff-product-verify supports boogie, corral, and symbooglix")
+
+    verifier_output = try_command(command, timeout=verify_args.time_limit)
+    verifier_output = transform_out(verify_args, verifier_output)
+    return verifier_output, verification_result(verifier_output, verify_args.verifier)
 
 
 def clean_up_upon_sigterm(main):
@@ -1326,7 +1691,7 @@ def main():
         global args
         args = arguments()
 
-        if args.diff_product:
+        if getattr(args, 'diff_product_mode', None):
             if not args.quiet:
                 print("SMACK program verifier version %s" % VERSION)
             run_diff_product(args)

@@ -293,9 +293,12 @@ def json_compilation_database_frontend(input_file, args):
                 command = optimization_flags.sub("-O0", command)
                 command = command + " -emit-llvm"
                 try_command(command.split(), cc['directory'], console=True)
-    # import here to avoid a circular import
-    from .top import llvm_to_bpl
-    llvm_to_bpl(args)
+    if not getattr(args, 'skip_llvm_to_bpl', False):
+        # import here to avoid a circular import
+        from .top import llvm_to_bpl
+        llvm_to_bpl(args)
+
+    return args.linked_bc_file
 
 
 def default_cargo_compile_command(args):
@@ -522,6 +525,9 @@ def link_bc_files(bitcodes, libs, args):
     try_command([llvm_exact_bin('llvm-link'), '-o', args.linked_bc_file,
                  args.bc_file] + smack_libs)
 
-    # import here to avoid a circular import
-    from .top import llvm_to_bpl
-    llvm_to_bpl(args)
+    if not getattr(args, 'skip_llvm_to_bpl', False):
+        # import here to avoid a circular import
+        from .top import llvm_to_bpl
+        llvm_to_bpl(args)
+
+    return args.linked_bc_file

@@ -196,7 +196,7 @@ def boogie_parser() -> Any:
 def boogie_classes() -> dict[str, Any]:
     ensure_parent_repo_on_path()
     from interpreter.parser.declaration import ProcedureDeclaration
-    from interpreter.parser.expression import Identifier, MapSelect, StorageIdentifier
+    from interpreter.parser.expression import Identifier, MapSelect, MapUpdate, StorageIdentifier
     from interpreter.parser.expression import (
         ArithmeticNegation,
         BinaryExpression,
@@ -233,6 +233,7 @@ def boogie_classes() -> dict[str, Any]:
         "IntegerLiteral": IntegerLiteral,
         "LogicalNegation": LogicalNegation,
         "MapSelect": MapSelect,
+        "MapUpdate": MapUpdate,
         "ProcedureDeclaration": ProcedureDeclaration,
         "Program": Program,
         "ReturnStatement": ReturnStatement,

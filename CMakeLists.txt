@@ -126,6 +126,8 @@ add_library(smackTranslator STATIC
   include/smack/VerifierCodeMetadata.h
   include/smack/SimplifyLibCalls.h
   include/smack/SmackRep.h
+  include/smack/DiffProductMatcher.h
+  include/smack/SmackPipeline.h
   include/smack/VectorOperations.h
   include/smack/MemorySafetyChecker.h
   include/smack/IntegerOverflowChecker.h
@@ -154,6 +156,8 @@ add_library(smackTranslator STATIC
   lib/smack/VerifierCodeMetadata.cpp
   lib/smack/SimplifyLibCalls.cpp
   lib/smack/SmackRep.cpp
+  lib/smack/DiffProductMatcher.cpp
+  lib/smack/SmackPipeline.cpp
   lib/smack/VectorOperations.cpp
   lib/smack/MemorySafetyChecker.cpp
   lib/smack/IntegerOverflowChecker.cpp
@@ -171,6 +175,11 @@ add_executable(llvm2bpl
   tools/llvm2bpl/llvm2bpl.cpp
 )
 smack_force_llvm_compat(llvm2bpl)
+
+add_executable(llvm-diffmatch2bpl
+  tools/diffmatch/llvm-diffmatch2bpl.cpp
+)
+smack_force_llvm_compat(llvm-diffmatch2bpl)
 
 add_library(externalizePass STATIC
   tools/externalizer/ExternalizePass.h
@@ -212,12 +221,13 @@ set(CMAKE_BUILD_TYPE ${SMACK_BUILD_TYPE})
 target_link_libraries(smackTranslator ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS}
   ${LLVM_LDFLAGS})
 target_link_libraries(llvm2bpl smackTranslator utils SeaDsaAnalysis)
+target_link_libraries(llvm-diffmatch2bpl smackTranslator utils SeaDsaAnalysis)
 
 target_link_libraries(externalizePass ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS}
   ${LLVM_LDFLAGS})
 target_link_libraries(extern-statics externalizePass)
 
-install(TARGETS llvm2bpl
+install(TARGETS llvm2bpl llvm-diffmatch2bpl
   RUNTIME DESTINATION bin
 )
 
