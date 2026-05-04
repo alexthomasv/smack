@@ -290,9 +290,10 @@ void Regions::visitCallInst(CallInst &I) {
     const PointerType *T = dyn_cast<PointerType>(P->getType());
     assert(T && "Expected pointer argument.");
 
-    if (auto I = dyn_cast<ConstantInt>(N)) {
-      const unsigned bound = I->getZExtValue();
-      const unsigned size = T->getElementType()->getIntegerBitWidth() / 8;
+    if (auto CI = dyn_cast<ConstantInt>(N)) {
+      const unsigned bound = CI->getZExtValue();
+      const DataLayout &DL = I.getModule()->getDataLayout();
+      const unsigned size = DL.getTypeStoreSize(T->getElementType());
       const unsigned length = bound * size;
       idx(P, length);
 

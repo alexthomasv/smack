@@ -363,14 +363,21 @@ Devirtualize::makeDirectCall (CallBase *CS) {
 
   // TODO should we allow non-matching targets?
   // TODO non-matching targets leads to crashes in bounce creation
+  // __SMACK_value is an annotation helper, not a real indirect-call target.
   if (CCG->isComplete(*CS)) {
-    for (auto F = CCG->begin(*CS); F != CCG->end(*CS); ++F)
+    for (auto F = CCG->begin(*CS); F != CCG->end(*CS); ++F) {
+      if ((*F)->getName() == "__SMACK_value")
+        continue;
       if (match(CS, **F))
         Targets.push_back(*F);
+    }
   } else {
-    for (auto &F : *CS->getParent()->getParent()->getParent())
+    for (auto &F : *CS->getParent()->getParent()->getParent()) {
+      if (F.getName() == "__SMACK_value")
+        continue;
       if (F.hasAddressTaken() && match(CS, F))
         Targets.push_back(&F);
+    }
   }
 
   //

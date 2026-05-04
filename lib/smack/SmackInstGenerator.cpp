@@ -13,7 +13,10 @@
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/InstVisitor.h"
+#include <fstream>
 #include "llvm/Support/GraphWriter.h"
+#include "smack/Regions.h"
+#include <regex>
 #include <sstream>
 
 #include "llvm/Support/raw_ostream.h"
@@ -90,6 +93,43 @@ void SmackInstGenerator::nameInstruction(llvm::Instruction &inst) {
       Decl::variable(naming->get(inst), rep->type(&inst)));
 }
 
+std::string SmackInstGenerator::getSourceLine(const std::string &filename,
+                                               unsigned line) {
+  if (line == 0)
+    return "";
+  auto it = sourceLineCache.find(filename);
+  if (it == sourceLineCache.end()) {
+    // Try to read the file from multiple candidate paths
+    std::vector<std::string> lines;
+    std::vector<std::string> candidates = {
+      filename,
+      "../" + filename,           // from build/ up to examples/
+      "../../" + filename,        // from build/ up to project root
+    };
+    for (auto &path : candidates) {
+      std::ifstream ifs(path);
+      if (ifs.is_open()) {
+        std::string l;
+        while (std::getline(ifs, l))
+          lines.push_back(l);
+        break;
+      }
+    }
+    it = sourceLineCache.emplace(filename, std::move(lines)).first;
+  }
+  auto &lines = it->second;
+  if (line <= lines.size()) {
+    // Trim leading/trailing whitespace
+    std::string s = lines[line - 1];
+    size_t start = s.find_first_not_of(" \t");
+    if (start == std::string::npos)
+      return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+  }
+  return "";
+}
+
 void SmackInstGenerator::annotate(llvm::Instruction &I, Block *B) {
 
   // do not generate sourceloc from calls to llvm.debug since
@@ -105,8 +145,15 @@ void SmackInstGenerator::annotate(llvm::Instruction &I, Block *B) {
   if (SmackOptions::SourceLocSymbols && I.getMetadata("dbg")) {
     const DebugLoc DL = I.getDebugLoc();
     auto *scope = cast<DIScope>(DL.getScope());
-    B->addStmt(Stmt::annot(Attr::attr("sourceloc", scope->getFilename().str(),
-                                      DL.getLine(), DL.getCol())));
+    std::string filename = scope->getFilename().str();
+    unsigned line = DL.getLine();
+    B->addStmt(Stmt::annot(Attr::attr("sourceloc", filename,
+                                      line, DL.getCol())));
+    // Embed the actual C source line text
+    std::string srcLine = getSourceLine(filename, line);
+    if (!srcLine.empty()) {
+      B->addStmt(Stmt::annot(Attr::attr("c_line", srcLine)));
+    }
   }
 
   // https://stackoverflow.com/questions/22138947/reading-metadata-from-instruction
@@ -169,6 +216,45 @@ void SmackInstGenerator::visitBasicBlock(llvm::BasicBlock &bb) {
       }
     }
   }
+
+  // Loop structure annotations: mark headers and body blocks.
+  // PHI disambiguation: for loop headers, emit .pre captures.
+  // For loop body blocks, activate PHI-to-.pre renaming so body
+  // instructions reference .pre instead of the PHI variables.
+  llvm::Loop *L = loops.getLoopFor(&bb);
+  if (L) {
+    std::string headerName = naming->get(*L->getHeader());
+    if (L->getHeader() == &bb) {
+      // Annotate as loop header
+      emit(Stmt::annot(Attr::attr("loop_header", headerName)));
+
+      // Loop header: emit $var.pre := $var for each PHI
+      rep->clearPhiPreRenames();
+      for (auto &I : bb) {
+        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&I)) {
+          std::string phiName = naming->get(*phi);
+          std::string preName = phiName + ".pre";
+          proc->getDeclarations().push_back(
+              Decl::variable(preName, rep->type(phi)));
+          emit(Stmt::assign(Expr::id(preName), Expr::id(phiName)));
+        }
+      }
+    } else {
+      // Annotate as loop body
+      emit(Stmt::annot(Attr::attr("loop_body", headerName)));
+
+      // Loop body block: activate PHI-to-.pre renaming
+      rep->clearPhiPreRenames();
+      for (auto &I : *L->getHeader()) {
+        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&I)) {
+          std::string preName = naming->get(*phi) + ".pre";
+          rep->setPhiPreRename(phi, preName);
+        }
+      }
+    }
+  } else {
+    rep->clearPhiPreRenames();
+  }
 }
 
 void SmackInstGenerator::visitInstruction(llvm::Instruction &inst) {
@@ -178,13 +264,20 @@ void SmackInstGenerator::visitInstruction(llvm::Instruction &inst) {
 
 void SmackInstGenerator::generatePhiAssigns(llvm::Instruction &ti) {
   llvm::BasicBlock *block = ti.getParent();
+  // Temporarily disable PHI renames for the PHI assignment itself;
+  // the LHS must use the original PHI variable names, not .pre.
+  auto savedRenames = rep->phiPreRenames;
+  rep->clearPhiPreRenames();
+
   std::list<const Expr *> lhs;
   std::list<const Expr *> rhs;
+
   for (unsigned i = 0; i < ti.getNumSuccessors(); i++) {
+    llvm::BasicBlock *successor = ti.getSuccessor(i);
 
     // write to the phi-node variable of the successor
-    for (llvm::BasicBlock::iterator s = ti.getSuccessor(i)->begin(),
-                                    e = ti.getSuccessor(i)->end();
+    for (llvm::BasicBlock::iterator s = successor->begin(),
+                                    e = successor->end();
          s != e && llvm::isa<llvm::PHINode>(s); ++s) {
 
       llvm::PHINode *phi = llvm::cast<llvm::PHINode>(s);
@@ -198,6 +291,9 @@ void SmackInstGenerator::generatePhiAssigns(llvm::Instruction &ti) {
   if (!lhs.empty()) {
     emit(Stmt::assign(lhs, rhs));
   }
+
+  // Restore renames
+  rep->phiPreRenames = savedRenames;
 }
 
 void SmackInstGenerator::generateGotoStmts(
@@ -213,15 +309,27 @@ void SmackInstGenerator::generateGotoStmts(
       const Expr *condition = targets[i].first;
       llvm::BasicBlock *target = targets[i].second;
 
+      // Tag every branch-target assume with ``:partition``.  Boogie
+      // already emits this attribute when it desugars structured
+      // ``if`` / ``while`` constructs (BigBlocksResolutionContext.cs),
+      // but SMACK lowers LLVM branches directly to goto+assume form,
+      // bypassing that path.  Without the tag the verifier's data
+      // back-slice can't recognise the assume as a branch condition
+      // (``extract_condition_and_pc_from_block`` filters by attribute),
+      // so reach-style proofs walk straight past every MAIN-level
+      // branch and accumulate vacuous implications all the way back
+      // to the alloc partitions.
+      const Attr *partitionAttr = Attr::attr("partition");
+
       if (target->getUniquePredecessor() == inst.getParent()) {
         Block *b = getBlock(target);
-        b->insert(Stmt::assume(condition));
+        b->insert(Stmt::assume(condition, partitionAttr));
         dispatch.push_back(b->getName());
 
       } else {
         Block *b = createBlock();
         annotate(inst, b);
-        b->addStmt(Stmt::assume(condition));
+        b->addStmt(Stmt::assume(condition, partitionAttr));
         b->addStmt(Stmt::goto_({getBlock(target)->getName()}));
         dispatch.push_back(b->getName());
       }
@@ -581,6 +689,10 @@ void SmackInstGenerator::visitGetElementPtrInst(llvm::GetElementPtrInst &I) {
 /******************************************************************************/
 
 void SmackInstGenerator::visitCastInst(llvm::CastInst &I) {
+  if (isa<BitCastInst>(I) && I.getSrcTy()->isPointerTy() && I.getDestTy()->isPointerTy()) {
+    return;
+  }
+
   processInstruction(I);
   const Expr *E;
   if (isa<FixedVectorType>(I.getType())) {
@@ -660,6 +772,23 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     // Skip this assertion if we shouldn't check in the parent function
     return;
 
+  } else if (name == "__VERIFIER_assume" && ci.getNumArgOperands() == 1) {
+    // Emit assume directly in the caller, without inline procedure indirection.
+    // This keeps the assume's variable in the caller's scope so the
+    // backslice can trace constraints back to the original parameters.
+    const Expr *arg = rep->expr(ci.getArgOperand(0));
+    emit(Stmt::assume(Expr::neq(arg, Expr::id("$0"))));
+    return;
+
+  } else if (name == "__VERIFIER_assert" &&
+             SmackOptions::shouldCheckFunction(
+                 ci.getParent()->getParent()->getName()) &&
+             ci.getNumArgOperands() == 1) {
+    // Emit assert directly in the caller, same as assume but for asserts.
+    const Expr *arg = rep->expr(ci.getArgOperand(0));
+    emit(Stmt::assert_(Expr::neq(arg, Expr::id("$0"))));
+    return;
+
   } else if (name.find(Naming::VALUE_PROC) != StringRef::npos) {
     emit(rep->valueAnnotation(ci));
 
@@ -670,7 +799,174 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     proc->getModifies().push_back(rep->code(ci));
 
   } else if (name.find(Naming::CODE_PROC) != StringRef::npos) {
-    emit(Stmt::code(rep->code(ci)));
+    std::string boogieCode = rep->code(ci);
+
+    for (unsigned i = 0; i < ci.getNumArgOperands(); ++i) {
+      llvm::Value *arg = ci.getArgOperand(i);
+
+      if (!arg || !arg->getType()->isPointerTy())
+        continue;
+
+      std::stringstream ss;
+      rep->expr(arg)->print(ss);
+      std::string boogieVar = ss.str();
+      std::string searchToken = "MEM(" + boogieVar + ")";
+
+      if (boogieCode.find(searchToken) != std::string::npos) {
+        unsigned regionId = rep->getRegions()->idx(arg);
+        std::string mapName = "$M." + std::to_string(regionId);
+
+        size_t pos = 0;
+        while ((pos = boogieCode.find(searchToken, pos)) != std::string::npos) {
+          boogieCode.replace(pos, searchToken.length(), mapName);
+          pos += mapName.length();
+        }
+      }
+    }
+
+    // Fix SMACK inconsistency: some constant args are emitted as "2bv64"
+    // instead of "2".  Boogie rejects bv64 in ref-typed contexts ($add.ref,
+    // $mul.ref). Normalize NNNbv64 to NNN in the generated code string.
+    {
+      std::regex bvRe("([0-9]+)bv64");
+      boogieCode = std::regex_replace(boogieCode, bvRe, "$1");
+    }
+
+    auto L = loops[ci.getParent()];
+
+    if (L && boogieCode.find("ptr_counter") != std::string::npos) {
+      std::string storeAddrs;
+      for (auto *BB : L->blocks()) {
+        for (auto &I : *BB) {
+          if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+            llvm::Value *ptr = SI->getPointerOperand();
+            if (llvm::isa<llvm::GetElementPtrInst>(ptr) ||
+                llvm::isa<llvm::PHINode>(ptr)) {
+              std::stringstream ss;
+              rep->expr(ptr)->print(ss);
+              std::string name = ss.str();
+              if (name.find(".shadow") == std::string::npos &&
+                  storeAddrs.find(name) == std::string::npos) {
+                if (!storeAddrs.empty())
+                  storeAddrs += ", ";
+                storeAddrs += name;
+              }
+            }
+          }
+        }
+      }
+      if (!storeAddrs.empty()) {
+        size_t pos = boogieCode.find("1 == 1;");
+        if (pos != std::string::npos) {
+          boogieCode.insert(pos, "{:store_addr " + storeAddrs + "} ");
+        }
+      }
+    }
+
+    if (L && boogieCode.find("loop_invariant") != std::string::npos) {
+      auto H = L->getHeader();
+      if (H && blockMap.count(H)) {
+        blockMap[H]->getStatements().push_front(Stmt::code(boogieCode));
+      } else {
+        emit(Stmt::code(boogieCode));
+      }
+    } else {
+      emit(Stmt::code(boogieCode));
+    }
+
+  } else if (name.find(Naming::INV_PROC_PREFIX) != StringRef::npos) {
+    // Structured loop invariant intrinsics.
+    // SMACK generates the full Boogie string; no format strings needed.
+    // Helper: get Boogie variable name for call argument at index i
+    auto bv = [&](unsigned i) -> std::string {
+      std::ostringstream ss;
+      rep->expr(ci.getArgOperand(i))->print(ss);
+      return ss.str();
+    };
+    // Helper: get memory region name ($M.N) for pointer argument at index i
+    auto mr = [&](unsigned i) -> std::string {
+      return "$M." + std::to_string(rep->getRegions()->idx(ci.getArgOperand(i)));
+    };
+
+    std::string boogieCode;
+    std::string invName = name.substr(Naming::INV_PROC_PREFIX.size()).str();
+
+    if (invName == "byte_copy_fwd") {
+      // __SMACK_inv_byte_copy_fwd(free_var, dst, src, loop_var, count)
+      std::string k = bv(0), d = bv(1), s = bv(2), i = bv(3), n = bv(4);
+      std::string dM = mr(1), sM = mr(2);
+      boogieCode =
+        "assume {:loop_invariant} {:custom \"memmove_forward_correctness\"} "
+        "{:free_var " + k + "} {:d " + d + "} {:s " + s + "} "
+        "{:i " + i + "} {:n " + n + "} "
+        "$or.i1("
+          "$not.i1($ult.i64(" + k + ", " + i + ")), "
+          "$eq.i8("
+            "$load.i8(" + dM + ", $add.i64(" + d + ", " + k + ")), "
+            "$load.i8(" + sM + ", $add.i64(" + s + ", " + k + "))"
+          ")"
+        ") == 1;";
+
+    } else if (invName == "byte_copy_bwd") {
+      // __SMACK_inv_byte_copy_bwd(free_var, dst, src, loop_var, count)
+      std::string k = bv(0), d = bv(1), s = bv(2), i = bv(3), n = bv(4);
+      std::string dM = mr(1), sM = mr(2);
+      boogieCode =
+        "assume {:loop_invariant} {:custom \"memmove_backward_correctness\"} "
+        "{:free_var " + k + "} {:d " + d + "} {:s " + s + "} "
+        "{:i " + i + "} {:n " + n + "} "
+        "$or.i1("
+          "$not.i1($and.i1($ule.i64(" + i + ", " + k + "), "
+                           "$ult.i64(" + k + ", " + n + "))), "
+          "$eq.i8("
+            "$load.i8(" + dM + ", $add.i64(" + d + ", " + k + ")), "
+            "$load.i8(" + sM + ", $add.i64(" + s + ", " + k + "))"
+          ")"
+        ") == 1;";
+
+    } else if (invName == "bounds") {
+      // __SMACK_inv_bounds(var, upper)
+      boogieCode =
+        "assume {:loop_invariant} $ule.i64(" + bv(0) + ", " + bv(1) + ") == 1;";
+
+    } else if (invName == "ptr_progress") {
+      // __SMACK_inv_ptr_progress(ptr, base, total, remaining, stride)
+      // stride is a compile-time constant
+      std::string ptr = bv(0), base = bv(1), total = bv(2), rem = bv(3);
+      std::string stride = bv(4);
+      boogieCode =
+        "assume {:loop_invariant} $eq.i64(" + ptr + ", "
+        "$add.i64(" + base + ", $mul.i64($sub.i64(" + total + ", " + rem + "), "
+        + stride + "))) == 1;";
+
+    } else if (invName == "buffer") {
+      // __SMACK_inv_buffer(ptr, ptr_init, len, len_init)
+      std::string p = bv(0), pi = bv(1), l = bv(2), li = bv(3);
+      boogieCode =
+        "assume {:loop_invariant} {:custom \"e_buffer_consistency\"} "
+        "{:free_var " + p + "} "
+        "{:ptr " + p + "} {:ptr_init " + pi + "} "
+        "{:len " + l + "} {:len_init " + li + "} "
+        "$and.i1($ule.i64(" + l + ", " + li + "), "
+        "$eq.i64(" + p + ", $add.i64(" + pi + ", $sub.i64(" + li + ", " + l + "))))"
+        " == 1;";
+
+    } else {
+      llvm_unreachable(("Unknown SMACK invariant intrinsic: " + name).c_str());
+    }
+
+    // Hoist to loop header (same logic as __SMACK_code)
+    auto L = loops[ci.getParent()];
+    if (L) {
+      auto H = L->getHeader();
+      if (H && blockMap.count(H)) {
+        blockMap[H]->getStatements().push_front(Stmt::code(boogieCode));
+      } else {
+        emit(Stmt::code(boogieCode));
+      }
+    } else {
+      emit(Stmt::code(boogieCode));
+    }
 
   } else if (name.find(Naming::DECL_PROC) != StringRef::npos) {
     std::string code = rep->code(ci);

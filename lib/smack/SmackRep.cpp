@@ -359,28 +359,74 @@ const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
 
   if (CI.getNumArgOperands() == 1) {
     name = indexedName(Naming::VALUE_PROC, {type(V->getType())});
-    if (dyn_cast<const Argument>(V)) {
-      attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*V))}));
 
-    } else if (auto LI = dyn_cast<const LoadInst>(V)) {
-      auto GEP = dyn_cast<const GetElementPtrInst>(LI->getPointerOperand());
-      assert(GEP && "Expected GEP argument to load instruction.");
-      auto A = dyn_cast<const Argument>(GEP->getPointerOperand());
-      assert(A && "Expected function argument to GEP instruction.");
-      auto T = GEP->getResultElementType();
-      const unsigned bits = this->getSize(T);
-      const unsigned bytes = bits / 8;
-      const unsigned R = regions->idx(GEP);
-      bool bytewise = regions->get(R).bytewiseAccess();
-      attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*A))}));
-      attrs.push_back(Attr::attr(
-          "field", {
-                       Expr::lit(Naming::LOAD + "." +
-                                 (bytewise ? "bytes." : "") + intType(bits)),
-                       Expr::id(memPath(R)),
-                       ptrArith(GEP),
-                       Expr::lit(bytes),
-                   }));
+    const Value *ResolvedV = V;
+    while (auto *BC = dyn_cast<const BitCastInst>(ResolvedV))
+      ResolvedV = BC->getOperand(0);
+
+    if (dyn_cast<const Argument>(ResolvedV)) {
+      attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*ResolvedV))}));
+
+    } else if (auto *LI = dyn_cast<const LoadInst>(ResolvedV)) {
+      if (auto *AI = dyn_cast<const AllocaInst>(LI->getPointerOperand())) {
+        auto T = AI->getAllocatedType();
+        const unsigned bits = this->getSize(T);
+        const unsigned bytes = bits / 8;
+        const unsigned R = regions->idx(AI);
+        bool bytewise = regions->get(R).bytewiseAccess();
+
+        attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*AI))}));
+        attrs.push_back(Attr::attr(
+            "field", {Expr::lit(Naming::LOAD + "." +
+                                (bytewise ? "bytes." : "") + intType(bits)),
+                      Expr::id(memPath(R)),
+                      expr(AI),
+                      Expr::lit(bytes)}));
+
+      } else if (auto *ArgPtr =
+                     dyn_cast<const Argument>(LI->getPointerOperand())) {
+        attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*ArgPtr))}));
+
+      } else {
+        auto *GEP = dyn_cast<const GetElementPtrInst>(LI->getPointerOperand());
+        assert(GEP &&
+               "Expected GEP or Argument for load instruction pointer operand.");
+
+        const Value *Base = GEP->getPointerOperand();
+        while (true) {
+          if (auto *BC = dyn_cast<BitCastInst>(Base)) {
+            Base = BC->getOperand(0);
+          } else if (auto *NextGEP = dyn_cast<GetElementPtrInst>(Base)) {
+            Base = NextGEP->getPointerOperand();
+          } else {
+            break;
+          }
+        }
+
+        auto T = GEP->getResultElementType();
+        const unsigned bits = this->getSize(T);
+        const unsigned bytes = bits / 8;
+        const unsigned R = regions->idx(GEP);
+        bool bytewise = regions->get(R).bytewiseAccess();
+
+        if (auto *I = dyn_cast<Instruction>(Base)) {
+          if (!I->hasName())
+            naming->get(*I);
+        }
+
+        attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*Base))}));
+        attrs.push_back(Attr::attr(
+            "field", {Expr::lit(Naming::LOAD + "." +
+                                (bytewise ? "bytes." : "") + intType(bits)),
+                      Expr::id(memPath(R)),
+                      ptrArith(GEP),
+                      Expr::lit(bytes)}));
+      }
+
+    } else if (auto *Inst = dyn_cast<const Instruction>(ResolvedV)) {
+      if (!Inst->hasName())
+        naming->get(*Inst);
+      attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*Inst))}));
 
     } else {
       llvm_unreachable("Unexpected argument type.");
@@ -388,53 +434,171 @@ const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
 
   } else {
     name = Naming::VALUE_PROC + "s";
-    const Argument *A;
-    Type *T;
-    const Expr *addr;
+    const Value *BaseObj = nullptr;
+    Type *T = nullptr;
+    const Expr *addr = nullptr;
 
-    if ((A = dyn_cast<const Argument>(V))) {
+    if (auto *A = dyn_cast<const Argument>(V)) {
       auto PT = dyn_cast<const PointerType>(A->getType());
       assert(PT && "Expected pointer argument.");
       T = PT->getElementType();
       addr = expr(A);
+      BaseObj = A;
 
     } else if (auto GEP = dyn_cast<const GetElementPtrInst>(V)) {
-      A = dyn_cast<const Argument>(GEP->getPointerOperand());
-      assert(A && "Expected function argument to GEP instruction.");
+      const Value *PtrOp = GEP->getPointerOperand();
+      while (true) {
+        if (auto *BC = dyn_cast<BitCastInst>(PtrOp)) {
+          PtrOp = BC->getOperand(0);
+        } else if (auto *NextGEP = dyn_cast<GetElementPtrInst>(PtrOp)) {
+          PtrOp = NextGEP->getPointerOperand();
+        } else {
+          break;
+        }
+      }
+      BaseObj = PtrOp;
       T = GEP->getResultElementType();
       addr = ptrArith(GEP);
+
+      // Check for pointer aliasing: if GEP's pointer operand is a LoadInst
+      // from a struct field we've seen before, emit {:ptr_alias} to equate
+      // the loaded pointers.  E.g. __SMACK_values(sk->p + 2, 254) where
+      // sk->p was already seen in __SMACK_values(sk->p, 2).
+      if (auto *BaseLI = dyn_cast<const LoadInst>(GEP->getPointerOperand())) {
+        if (auto *BaseGEP =
+                dyn_cast<const GetElementPtrInst>(BaseLI->getPointerOperand())) {
+          std::ostringstream gepKeyStream;
+          ptrArith(BaseGEP)->print(gepKeyStream);
+          std::string gepKey = gepKeyStream.str();
+
+          std::string loadedPtrName = naming->get(*BaseLI);
+          auto aliasIt = annotationPtrAliases.find(gepKey);
+          if (aliasIt != annotationPtrAliases.end()) {
+            attrs.push_back(Attr::attr(
+                "ptr_alias",
+                {Expr::id(aliasIt->second), Expr::id(loadedPtrName)}));
+          } else {
+            annotationPtrAliases[gepKey] = loadedPtrName;
+          }
+        }
+      }
 
     } else if (auto LI = dyn_cast<const LoadInst>(V)) {
       auto GEP = dyn_cast<const GetElementPtrInst>(LI->getPointerOperand());
       assert(GEP && "Expected GEP argument to load instruction.");
-      A = dyn_cast<const Argument>(GEP->getPointerOperand());
-      assert(A && "Expected function argument to GEP instruction.");
-      assert(A->hasName() && "Expected named argument.");
+
+      const Value *PtrOp = GEP->getPointerOperand();
+      while (true) {
+        if (auto *BC = dyn_cast<BitCastInst>(PtrOp)) {
+          PtrOp = BC->getOperand(0);
+        } else if (auto *NextGEP = dyn_cast<GetElementPtrInst>(PtrOp)) {
+          PtrOp = NextGEP->getPointerOperand();
+        } else {
+          break;
+        }
+      }
+      BaseObj = PtrOp;
+
       auto PT = dyn_cast<PointerType>(V->getType());
       assert(PT && "Expected pointer type result of load instruction.");
       T = PT->getElementType();
-      addr = ptrArith(GEP);
+      // Use the LOADED pointer value as the array base address,
+      // not the struct offset where the pointer is stored.
+      // ptrArith(GEP) is the struct location; expr(LI) is the pointer value.
+      addr = expr(LI);
+
+      // Check for pointer aliasing: if two __SMACK_values calls load from
+      // the same struct field (same GEP expression), emit {:ptr_alias} so
+      // the verifier knows the loaded pointers are equal.
+      {
+        std::ostringstream gepKeyStream;
+        ptrArith(GEP)->print(gepKeyStream);
+        std::string gepKey = gepKeyStream.str();
+
+        std::string loadedPtrName = naming->get(*LI);
+        auto aliasIt = annotationPtrAliases.find(gepKey);
+        if (aliasIt != annotationPtrAliases.end()) {
+          attrs.push_back(Attr::attr(
+              "ptr_alias",
+              {Expr::id(aliasIt->second), Expr::id(loadedPtrName)}));
+        } else {
+          annotationPtrAliases[gepKey] = loadedPtrName;
+        }
+      }
+
+      // Emit {:field} for the struct pointer field load itself.
+      // This ensures pointer fields always get {:field} annotations,
+      // so the interpreter can concretize struct fields correctly.
+      // NOTE: The C wrapper must NOT have both public_in(__SMACK_value(sk->X))
+      // and private_in(__SMACK_values(sk->X, N)) for the same pointer field,
+      // as that would create conflicting public/private annotations on the
+      // same memory map.
+      {
+        auto fieldT = GEP->getResultElementType();
+        const unsigned fieldBits = this->getSize(fieldT);
+        const unsigned fieldBytes = fieldBits / 8;
+        const unsigned fieldR = regions->idx(GEP);
+        bool fieldBytewise = regions->get(fieldR).bytewiseAccess();
+        attrs.push_back(Attr::attr(
+            "field", {
+                         Expr::lit(Naming::LOAD + "." +
+                                   (fieldBytewise ? "bytes." : "") +
+                                   intType(fieldBits)),
+                         Expr::id(memPath(fieldR)),
+                         ptrArith(GEP),
+                         Expr::lit(fieldBytes),
+                     }));
+      }
+
+    } else if (auto AI = dyn_cast<const AllocaInst>(V)) {
+      auto *AT = dyn_cast<llvm::ArrayType>(AI->getAllocatedType());
+      assert(AT && "expected an array type on the stack");
+      T = AT->getElementType();
+      addr = expr(AI);
+      BaseObj = AI;
 
     } else {
       llvm_unreachable("Unexpected argument type.");
     }
 
-    assert(T && "Unkown access type.");
+    assert(BaseObj && "Could not determine base object for annotation");
+    if (auto *I = dyn_cast<Instruction>(BaseObj)) {
+      if (!I->hasName())
+        naming->get(*I);
+    }
+
+    attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*BaseObj))}));
+
+    assert(T && "Unknown access type.");
     auto I = dyn_cast<ConstantInt>(CI.getArgOperand(1));
     assert(I && "expected constant size expression.");
-    const unsigned count = I->getZExtValue();
-    const unsigned bits = this->getSize(T);
-    const unsigned bytes = bits / 8;
-    const unsigned length = count * bytes;
-    const unsigned R = regions->idx(V, length);
+
+    const unsigned argCount = I->getZExtValue();
+    const unsigned singleObjSize = this->getSize(T) / 8;
+    const unsigned totalBytes = argCount * singleObjSize;
+    unsigned elementSize = 1;
+
+    if (T->isArrayTy()) {
+      elementSize = this->getSize(T->getArrayElementType()) / 8;
+    } else if (!T->isStructTy()) {
+      elementSize = singleObjSize;
+    }
+
+    if (elementSize == 0)
+      elementSize = 1;
+    const unsigned bits = elementSize * 8;
+
+    const unsigned R = regions->idx(V, totalBytes);
     bool bytewise = regions->get(R).bytewiseAccess();
+
     args.push_back(expr(CI.getArgOperand(1)));
-    attrs.push_back(Attr::attr("name", {Expr::id(naming->get(*A))}));
+
     attrs.push_back(Attr::attr(
         "array",
         {Expr::lit(Naming::LOAD + "." + (bytewise ? "bytes." : "") +
                    intType(bits)),
-         Expr::id(memPath(R)), addr, Expr::lit(bytes), Expr::lit(length)}));
+         Expr::id(memPath(R)), addr, Expr::lit(elementSize),
+         Expr::lit(totalBytes)}));
   }
 
   return Stmt::call(name, args, rets, attrs);
@@ -580,7 +744,7 @@ const Expr *SmackRep::pointerToInteger(const Expr *e, unsigned width) {
 
 const Expr *SmackRep::integerToPointer(const Expr *e, unsigned width) {
   if (width < ptrSizeInBits)
-    e = Expr::fn(opName("$zext", {width, ptrSizeInBits}), e);
+    e = Expr::fn(opName("$sext", {width, ptrSizeInBits}), e);
   else if (width > ptrSizeInBits)
     e = Expr::fn(opName("$trunc", {width, ptrSizeInBits}), e);
   e = bitConversion(e, SmackOptions::BitPrecise,
@@ -796,6 +960,18 @@ const Expr *SmackRep::ptrArith(
 const Expr *SmackRep::expr(const llvm::Value *v, bool isConstIntUnsigned,
                            bool isUnsignedInst) {
   using namespace llvm;
+
+  // PHI pre-rename: inside loop bodies, PHI variables are referenced as .pre
+  auto phiIt = phiPreRenames.find(v);
+  if (phiIt != phiPreRenames.end()) {
+    return Expr::id(phiIt->second);
+  }
+
+  if (const BitCastInst *BC = dyn_cast<BitCastInst>(v)) {
+    if (BC->getSrcTy()->isPointerTy() && BC->getDestTy()->isPointerTy()) {
+      return expr(BC->getOperand(0), isConstIntUnsigned, isUnsignedInst);
+    }
+  }
 
   if (isa<const Constant>(v)) {
     v = v->stripPointerCastsAndAliases();

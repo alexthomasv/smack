@@ -35,6 +35,7 @@ const std::string Naming::CODE_PROC = "__SMACK_code";
 const std::string Naming::DECL_PROC = "__SMACK_decl";
 const std::string Naming::TOP_DECL_PROC = "__SMACK_top_decl";
 const std::string Naming::VALUE_PROC = "__SMACK_value";
+const std::string Naming::INV_PROC_PREFIX = "__SMACK_inv_";
 const std::string Naming::RETURN_VALUE_PROC = "__SMACK_return_value";
 const std::string Naming::INITIALIZE_PROC = "$initialize";
 const std::string Naming::STATIC_INIT_PROC = "__SMACK_static_init";

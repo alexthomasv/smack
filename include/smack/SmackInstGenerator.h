@@ -33,6 +33,10 @@ private:
   std::map<const llvm::BasicBlock *, Block *> blockMap;
   std::map<const llvm::Value *, std::string> sourceNames;
 
+  // Cache of source file lines by filename.
+  std::map<std::string, std::vector<std::string>> sourceLineCache;
+  std::string getSourceLine(const std::string &filename, unsigned line);
+
   Block *createBlock();
   Block *getBlock(llvm::BasicBlock *bb);
 

@@ -57,7 +57,21 @@ protected:
   std::vector<std::string> initFuncs;
   std::map<std::string, Decl *> auxDecls;
 
+  // Track GEP-based pointer loads for annotation aliasing.
+  // Key: string representation of the GEP address expression.
+  // Value: Boogie variable name of the first loaded pointer (e.g., "$p15").
+  std::map<std::string, std::string> annotationPtrAliases;
+
 public:
+  // PHI pre-rename map: when inside a loop body, PHI variables from the
+  // enclosing loop header should be referenced as .pre versions to
+  // disambiguate pre/post iteration values.
+  std::map<const llvm::Value *, std::string> phiPreRenames;
+
+  void setPhiPreRename(const llvm::Value *phi, const std::string &preName) {
+    phiPreRenames[phi] = preName;
+  }
+  void clearPhiPreRenames() { phiPreRenames.clear(); }
   SmackRep(const llvm::DataLayout *L, Naming *N, Program *P, Regions *R);
   Program *getProgram() { return program; }
 
@@ -206,6 +220,7 @@ public:
 
   bool isContractExpr(const llvm::Value *V) const;
   bool isContractExpr(const std::string S) const;
+  Regions* getRegions() const { return regions; }
 
   void addAuxiliaryDeclaration(Decl *D);
   std::list<Decl *> auxiliaryDeclarations();
