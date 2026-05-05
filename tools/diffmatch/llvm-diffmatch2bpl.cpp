@@ -76,6 +76,18 @@ static cl::opt<bool> Modular(
     cl::desc("Enable contracts-based modular deductive verification"),
     cl::init(false));
 
+static cl::opt<bool> StructuredBplLoops(
+    "structured-bpl-loops",
+    cl::desc("For functional-equivalence product lowering, emit supported "
+             "LLVM natural loops as structured Boogie while statements"),
+    cl::init(false));
+
+static cl::opt<bool> StructuredBplLoopsStrict(
+    "structured-bpl-loops-strict",
+    cl::desc("Fail paired product lowering if structured Boogie loop emission "
+             "cannot structure every detected LLVM loop"),
+    cl::init(false));
+
 namespace {
 
 void check(std::string E) {
@@ -112,12 +124,13 @@ void writeModuleLl(Module &module, const std::string &filename) {
   F.keep();
 }
 
-void writeBpl(Module &module, const std::string &filename) {
+void writeBpl(Module &module, const std::string &filename,
+              const smack::SmackBplOptions &options) {
   std::error_code EC;
   ToolOutputFile F(filename.c_str(), EC, sys::fs::OF_None);
   if (EC)
     check(EC.message());
-  smack::emitSmackBpl(module, F.os());
+  smack::emitSmackBpl(module, F.os(), options);
   F.keep();
 }
 
@@ -166,8 +179,11 @@ int main(int argc, char **argv) {
 
   writeModuleLl(*leftModule, LeftLl);
   writeModuleLl(*rightModule, RightLl);
-  writeBpl(*leftModule, LeftBpl);
-  writeBpl(*rightModule, RightBpl);
+  smack::SmackBplOptions bplOptions;
+  bplOptions.structuredLoops = StructuredBplLoops || StructuredBplLoopsStrict;
+  bplOptions.structuredLoopsStrict = StructuredBplLoopsStrict;
+  writeBpl(*leftModule, LeftBpl, bplOptions);
+  writeBpl(*rightModule, RightBpl, bplOptions);
 
   return 0;
 }

@@ -296,6 +296,9 @@ public:
     GOTO,
     CALL,
     RETURN,
+    IF,
+    WHILE,
+    BREAK,
     CODE,
     COMMENT
   };
@@ -329,6 +332,11 @@ public:
   static const Stmt *goto_(std::list<std::string> ts);
   static const Stmt *havoc(std::string x);
   static const Stmt *havoc(const Expr *x);
+  static const Stmt *if_(const Expr *c, std::list<const Stmt *> thn,
+                         std::list<const Stmt *> els = {});
+  static const Stmt *while_(const Expr *g, std::list<const Expr *> invs,
+                            std::list<const Stmt *> body);
+  static const Stmt *break_();
   static const Stmt *return_();
   static const Stmt *return_(const Expr *e);
   static const Stmt *skip();
@@ -365,6 +373,7 @@ class AssumeStmt : public Stmt {
 public:
   AssumeStmt(const Expr *e) : Stmt(ASSUME), expr(e) {}
   void add(const Attr *a) { attrs.push_back(a); }
+  const Expr *getExpr() const { return expr; }
   bool hasAttr(std::string name) const {
     for (auto a = attrs.begin(); a != attrs.end(); ++a) {
       if ((*a)->getName() == name)
@@ -405,6 +414,7 @@ class GotoStmt : public Stmt {
 
 public:
   GotoStmt(std::list<std::string> ts) : Stmt(GOTO), targets(ts) {}
+  const std::list<std::string> &getTargets() const { return targets; }
   void print(std::ostream &os) const override;
   static bool classof(const Stmt *S) { return S->getKind() == GOTO; }
 };
@@ -425,6 +435,39 @@ public:
   ReturnStmt(const Expr *e = nullptr) : Stmt(RETURN), expr(e) {}
   void print(std::ostream &os) const override;
   static bool classof(const Stmt *S) { return S->getKind() == RETURN; }
+};
+
+class IfStmt : public Stmt {
+  const Expr *cond;
+  std::list<const Stmt *> thenStmts;
+  std::list<const Stmt *> elseStmts;
+
+public:
+  IfStmt(const Expr *c, std::list<const Stmt *> thn,
+         std::list<const Stmt *> els)
+      : Stmt(IF), cond(c), thenStmts(thn), elseStmts(els) {}
+  void print(std::ostream &os) const override;
+  static bool classof(const Stmt *S) { return S->getKind() == IF; }
+};
+
+class WhileStmt : public Stmt {
+  const Expr *guard;
+  std::list<const Expr *> invariants;
+  std::list<const Stmt *> body;
+
+public:
+  WhileStmt(const Expr *g, std::list<const Expr *> invs,
+            std::list<const Stmt *> body)
+      : Stmt(WHILE), guard(g), invariants(invs), body(body) {}
+  void print(std::ostream &os) const override;
+  static bool classof(const Stmt *S) { return S->getKind() == WHILE; }
+};
+
+class BreakStmt : public Stmt {
+public:
+  BreakStmt() : Stmt(BREAK) {}
+  void print(std::ostream &os) const override;
+  static bool classof(const Stmt *S) { return S->getKind() == BREAK; }
 };
 
 class CodeStmt : public Stmt {

@@ -165,9 +165,15 @@ void addSmackPreBplPasses(Module &module, legacy::PassManager &passManager,
   }
 }
 
-void addSmackBplPasses(legacy::PassManager &passManager, raw_ostream &out) {
-  passManager.add(new SmackModuleGenerator());
+void addSmackBplPasses(legacy::PassManager &passManager, raw_ostream &out,
+                       const SmackBplOptions &options) {
+  passManager.add(new SmackModuleGenerator(options.structuredLoops,
+                                           options.structuredLoopsStrict));
   passManager.add(new BplFilePrinter(out));
+}
+
+void addSmackBplPasses(legacy::PassManager &passManager, raw_ostream &out) {
+  addSmackBplPasses(passManager, out, SmackBplOptions{});
 }
 
 void runSmackPreBplPipeline(Module &module,
@@ -177,10 +183,15 @@ void runSmackPreBplPipeline(Module &module,
   passManager.run(module);
 }
 
-void emitSmackBpl(Module &module, raw_ostream &out) {
+void emitSmackBpl(Module &module, raw_ostream &out,
+                  const SmackBplOptions &options) {
   legacy::PassManager passManager;
-  addSmackBplPasses(passManager, out);
+  addSmackBplPasses(passManager, out, options);
   passManager.run(module);
+}
+
+void emitSmackBpl(Module &module, raw_ostream &out) {
+  emitSmackBpl(module, out, SmackBplOptions{});
 }
 
 } // namespace smack

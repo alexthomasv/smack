@@ -545,6 +545,20 @@ def arguments():
         help='dump normalized left/right LLVM IR while building --diff-product')
 
     translate_group.add_argument(
+        '--diff-product-structured-bpl-loops',
+        action='store_true',
+        default=False,
+        help='emit supported loops as structured Boogie while statements only '
+             'during paired diff-product lowering')
+
+    translate_group.add_argument(
+        '--diff-product-structured-bpl-loops-strict',
+        action='store_true',
+        default=False,
+        help='fail paired diff-product lowering if any loop cannot be emitted '
+             'as structured Boogie')
+
+    translate_group.add_argument(
         '--diff-product-alignment',
         choices=['auto', 'corerel', 'legacy', 'baseline'],
         default='auto',
@@ -847,6 +861,15 @@ def arguments():
         args.diff_product_mode = 'patch-with-right'
     else:
         args.diff_product_mode = None
+
+    if (
+        args.diff_product_structured_bpl_loops or
+        args.diff_product_structured_bpl_loops_strict
+    ) and not args.diff_product_mode:
+        parser.error(
+            '--diff-product-structured-bpl-loops is only valid in '
+            '--diff-product or --product-mode'
+        )
 
     if args.diff_product_mode:
         if args.diff_product_mode == 'patch-with-right' and (
@@ -1486,6 +1509,10 @@ def run_paired_diff_product_lowering(args, left_args, right_args, tmp_dir):
     if args.diff_product_dump_llvm:
         cmd += ['--left-ll', left_args.ll_file]
         cmd += ['--right-ll', right_args.ll_file]
+    if args.diff_product_structured_bpl_loops:
+        cmd += ['--structured-bpl-loops']
+    if args.diff_product_structured_bpl_loops_strict:
+        cmd += ['--structured-bpl-loops-strict']
     cmd += llvm_to_bpl_option_args(args, [args.diff_left_entry, args.diff_right_entry])
 
     if args.debug:

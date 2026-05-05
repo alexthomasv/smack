@@ -211,6 +211,18 @@ const Stmt *Stmt::havoc(const Expr *x) {
   return new HavocStmt(std::list<std::string>(1, s.str()));
 }
 
+const Stmt *Stmt::if_(const Expr *c, std::list<const Stmt *> thn,
+                      std::list<const Stmt *> els) {
+  return new IfStmt(c, thn, els);
+}
+
+const Stmt *Stmt::while_(const Expr *g, std::list<const Expr *> invs,
+                         std::list<const Stmt *> body) {
+  return new WhileStmt(g, invs, body);
+}
+
+const Stmt *Stmt::break_() { return new BreakStmt(); }
+
 const Stmt *Stmt::return_(const Expr *e) { return new ReturnStmt(e); }
 
 const Stmt *Stmt::return_() { return new ReturnStmt(); }
@@ -344,6 +356,14 @@ void print_seq(std::ostream &os, std::list<T> ts, std::string sep) {
 template <class T> void print_seq(std::ostream &os, std::list<T> ts) {
   print_seq<T>(os, ts, "", "", "");
 }
+
+void print_stmt_block(std::ostream &os, std::list<const Stmt *> stmts,
+                      std::string indent) {
+  for (auto i = stmts.begin(); i != stmts.end(); ++i) {
+    os << "\n" << indent << *i;
+  }
+}
+
 template <class T, class C>
 void print_set(std::ostream &os, std::set<T, C> ts, std::string init,
                std::string sep, std::string term) {
@@ -600,6 +620,29 @@ void ReturnStmt::print(std::ostream &os) const {
     os << " " << expr;
   os << ";";
 }
+
+void IfStmt::print(std::ostream &os) const {
+  os << "if (" << cond << ") {";
+  print_stmt_block(os, thenStmts, "  ");
+  os << "\n}";
+  if (!elseStmts.empty()) {
+    os << " else {";
+    print_stmt_block(os, elseStmts, "  ");
+    os << "\n}";
+  }
+}
+
+void WhileStmt::print(std::ostream &os) const {
+  os << "while (" << guard << ")";
+  for (auto inv : invariants) {
+    os << "\n  invariant " << inv << ";";
+  }
+  os << " {";
+  print_stmt_block(os, body, "  ");
+  os << "\n}";
+}
+
+void BreakStmt::print(std::ostream &os) const { os << "break;"; }
 
 void CodeStmt::print(std::ostream &os) const { os << code; }
 

@@ -13,11 +13,15 @@ class Program;
 class SmackModuleGenerator : public llvm::ModulePass {
 private:
   Program *program;
+  bool structuredBplLoops;
+  bool structuredBplLoopsStrict;
 
 public:
   static char ID; // Pass identification, replacement for typeid
 
   SmackModuleGenerator();
+  SmackModuleGenerator(bool structuredBplLoops,
+                       bool structuredBplLoopsStrict);
   virtual void getAnalysisUsage(llvm::AnalysisUsage &AU) const override;
   virtual bool runOnModule(llvm::Module &m) override;
   void generateProgram(llvm::Module &m);

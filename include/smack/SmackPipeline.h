@@ -23,6 +23,11 @@ struct SmackPipelineOptions {
   std::string defaultDataLayout;
 };
 
+struct SmackBplOptions {
+  bool structuredLoops = false;
+  bool structuredLoopsStrict = false;
+};
+
 void initializeSmackPipelinePasses();
 
 void addSmackPreBplPasses(llvm::Module &module,
@@ -31,11 +36,16 @@ void addSmackPreBplPasses(llvm::Module &module,
 
 void addSmackBplPasses(llvm::legacy::PassManager &passManager,
                        llvm::raw_ostream &out);
+void addSmackBplPasses(llvm::legacy::PassManager &passManager,
+                       llvm::raw_ostream &out,
+                       const SmackBplOptions &options);
 
 void runSmackPreBplPipeline(llvm::Module &module,
                             const SmackPipelineOptions &options);
 
 void emitSmackBpl(llvm::Module &module, llvm::raw_ostream &out);
+void emitSmackBpl(llvm::Module &module, llvm::raw_ostream &out,
+                  const SmackBplOptions &options);
 
 } // namespace smack
 
