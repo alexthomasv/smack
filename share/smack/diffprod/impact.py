@@ -118,16 +118,20 @@ def analyze_side_impact(
 
     for stmt_id in source_stmt_ids:
         origin = prov.origin_set(stmt_id)
-        span = origin.primary_span()
-        if span is None or is_synthetic_source(span):
-            continue
+        spans = [
+            span for span in origin.source_spans()
+            if not is_synthetic_source(span)
+        ]
         for hunk in hunks:
-            if span_intersects_hunk(
-                source_file=span.file,
-                start_line=span.start_line,
-                end_line=span.end_line or span.start_line,
-                hunk=hunk,
-                side=side,
+            if any(
+                span_intersects_hunk(
+                    source_file=span.file,
+                    start_line=span.start_line,
+                    end_line=span.end_line or span.start_line,
+                    hunk=hunk,
+                    side=side,
+                )
+                for span in spans
             ):
                 block_id = prov.stmt_to_block[stmt_id]
                 impact.impacted_statements.add(stmt_id)
@@ -181,6 +185,8 @@ def mark_block(
 ) -> None:
     impact.impacted_blocks.add(block_id)
     impact.add_reason(ImpactReason(node_id=block_id, reason=reason, via=via))
+    if reason == "contains-diff-stmt":
+        return
     for stmt_id in prov.stmt_order.get(block_id, []):
         impact.impacted_statements.add(stmt_id)
 

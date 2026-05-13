@@ -142,58 +142,267 @@ def try_build_generic_product(
         diagnostics.append("diffprod library product pass was not found")
         return None
     try:
-        from diffprod import bpl_emit, ir
-        from diffprod.boogie_bridge import build_product_from_boogie
-        from diffprod.product_pass import ProductPassOptions
+        from diffprod.product_v2 import build_product_ast
     except Exception as exc:
-        diagnostics.append(f"failed to import diffprod product pass: {exc}")
+        diagnostics.append(f"failed to import diffprod product_v2 pass: {exc}")
         return None
 
-    proc_name: str | tuple[str | None, str | None] | None
+    proc_name: str | None
     if left_entry or right_entry:
-        proc_name = (left_entry, right_entry)
+        if right_entry is not None and left_entry is not None and right_entry != left_entry:
+            diagnostics.append(
+                "actual product construction currently requires matching "
+                "left/right entries"
+            )
+            return None
+        proc_name = left_entry or right_entry
     else:
         proc_name = None
+    if proc_name is None:
+        diagnostics.append("actual product construction requires an entry procedure")
+        return None
+    if left is None or right is None or impact is None:
+        diagnostics.append("actual product construction requires parsed impact data")
+        return None
 
     try:
-        result = build_product_from_boogie(
-            left if left is not None else left_text,
-            right if right is not None else right_text,
-            diff_text,
-            proc_name=proc_name,
-            options=ProductPassOptions(
-                alignment=alignment,
-                no_egraph=no_egraph,
-                egraph_timeout_s=egraph_timeout_s,
-                structural_fallback=llvm_match is None,
-            ),
-            delta_node_ids_p=frozenset(impact.left.impacted_blocks)
-            if impact is not None
-            else frozenset(),
-            delta_node_ids_q=frozenset(impact.right.impacted_blocks)
-            if impact is not None
-            else frozenset(),
+        llvm_left_blocks = impacted_blocks_from_llvm_match(left, "left", llvm_match)
+        llvm_right_blocks = impacted_blocks_from_llvm_match(right, "right", llvm_match)
+        left_block_markers = product_block_marker_ids(impact.left) | llvm_left_blocks
+        right_block_markers = product_block_marker_ids(impact.right) | llvm_right_blocks
+        tagged_left = mark_impacted_statements(
+            left,
+            impact.left.impacted_statements,
+            left_block_markers,
+        )
+        tagged_right = mark_impacted_statements(
+            right,
+            impact.right.impacted_statements,
+            right_block_markers,
+        )
+        result = build_product_ast(
+            tagged_left,
+            tagged_right,
+            proc_name,
+            diff_text=diff_text,
+            disable_egraph=no_egraph or alignment == "baseline",
+            egraph_timeout_s=egraph_timeout_s,
         )
     except Exception as exc:
         diagnostics.append(f"actual product construction failed: {exc}")
         return None
 
-    diagnostics.extend(result.diagnostics)
-    diagnostics.extend(getattr(result.product, "diagnostics", []) or [])
-    if result.product is None:
-        return None
-    try:
-        text = emit_product_text(result.product.program, bpl_emit, ir)
-    except Exception as exc:
-        diagnostics.append(f"actual product emission failed: {exc}")
-        return None
-
-    return product_artifact_from_result(
+    diagnostics.extend(getattr(result, "diagnostics", []) or [])
+    text = strip_smack_instrumentation(result.program_text)
+    text = prepend_support_declarations(text, left_text, right_text)
+    return ProductArtifact(
         text=text,
-        result=result.product,
-        diagnostics=diagnostics,
-        actual_source="boogie-ast",
+        actual_product_available=True,
+        diagnostics=list(diagnostics),
+        mode=alignment if alignment != "auto" else "functional-equivalence",
+        actual_source="diffprod-product-v2",
+        delta_left_blocks=sorted(result.classification_p.delta),
+        delta_right_blocks=sorted(result.classification_q.delta),
+        lockstep_outcomes=[],
+        egraph_outcomes=[egraph_outcome_json(o) for o in result.align_outcomes],
+        structural=None,
+        selection=[
+            {
+                "selected": True,
+                "mode": alignment if alignment != "auto" else "functional-equivalence",
+                "source": "diffprod-product-v2",
+                "stable_pair_count": result.stable_pair_count,
+                "delta_region_count": result.delta_region_count,
+            }
+        ],
     )
+
+
+def product_block_marker_ids(side_impact: Any) -> set[str]:
+    """Blocks that should receive one block-level diff marker.
+
+    A block that merely contains a source-diff statement is not enough:
+    statement-level markers already carry that seed. Marking the first
+    statement of such a block destroys diff precision when structured
+    lowering emits a whole function or loop nest in one Boogie block.
+    """
+    out: set[str] = set()
+    for block_id in side_impact.impacted_blocks:
+        reasons = {
+            getattr(reason, "reason", "")
+            for reason in side_impact.reasons.get(block_id, []) or []
+        }
+        if reasons and reasons <= {"contains-diff-stmt"}:
+            continue
+        out.add(block_id)
+    return out
+
+
+def prepend_support_declarations(product_text: str, *source_texts: str) -> str:
+    """Preserve SMACK type/function prelude needed by the emitted product."""
+    decls: list[str] = []
+    seen: set[str] = set()
+    prefixes = ("type ", "const ", "function ", "axiom ")
+    for source in source_texts:
+        for line in source.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped in seen:
+                continue
+            if stripped.startswith(prefixes):
+                seen.add(stripped)
+                decls.append(stripped)
+                continue
+            if stripped.startswith("var "):
+                for side_decl in suffixed_global_var_decls(stripped):
+                    if side_decl not in seen:
+                        seen.add(side_decl)
+                        decls.append(side_decl)
+    if not decls:
+        return product_text
+    return "\n".join(decls) + "\n\n" + product_text
+
+
+def suffixed_global_var_decls(line: str) -> list[str]:
+    if not line.endswith(";") or ":" not in line:
+        return []
+    body = line[len("var ") : -1]
+    names_part, type_part = body.split(":", 1)
+    names = [name.strip() for name in names_part.split(",") if name.strip()]
+    out: list[str] = []
+    for name in names:
+        if name != "$exn":
+            continue
+        if name.endswith(".P") or name.endswith(".Q"):
+            continue
+        out.append("var %s.P:%s;" % (name, type_part))
+        out.append("var %s.Q:%s;" % (name, type_part))
+    return out
+
+
+def strip_smack_instrumentation(product_text: str) -> str:
+    """Drop source/provenance recording calls that are not part of the product."""
+    out: list[str] = []
+    for line in product_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("call $initialize("):
+            continue
+        if "boogie_si_record_" in stripped:
+            continue
+        if stripped.startswith("$exn.") and ":=" in stripped:
+            continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if product_text.endswith("\n") else "")
+
+
+def mark_impacted_statements(
+    parsed: ParsedBoogieProgram,
+    impacted_statement_ids: set[str],
+    impacted_block_ids: set[str],
+) -> str:
+    """Return Boogie text with ``:diff_affected`` markers before impacted stmts."""
+    if not impacted_statement_ids and not impacted_block_ids:
+        return str(parsed.ast)
+
+    from diffprod.boogie_bridge import _boogie_classes
+    from interpreter.parser.node import Attribute
+
+    classes = _boogie_classes()
+    AssumeStatement = classes["AssumeStatement"]
+    AssignStatement = classes["AssignStatement"]
+    BooleanLiteral = classes["BooleanLiteral"]
+    CallStatement = classes["CallStatement"]
+    HavocStatement = classes["HavocStatement"]
+    IfStatement = classes["IfStatement"]
+    ProcedureDeclaration = classes["ProcedureDeclaration"]
+    WhileStatement = classes["WhileStatement"]
+
+    def marker() -> Any:
+        return AssumeStatement(
+            attributes=[
+                Attribute(
+                    key="diff_affected",
+                    values=[BooleanLiteral(value=True)],
+                )
+            ],
+            expression=BooleanLiteral(value=True),
+        )
+
+    program = parsed.ast.clone()
+    for decl in getattr(program, "declarations", []) or []:
+        if (
+            not isinstance(decl, ProcedureDeclaration)
+            or getattr(decl, "body", None) is None
+        ):
+            continue
+        for block in decl.body.blocks:
+            block_id = "proc:%s:block:%s" % (decl.name, block.name)
+            block_mark_index = None
+            if block_id in impacted_block_ids:
+                preferred = (WhileStatement, IfStatement, AssignStatement)
+                fallback = (CallStatement, HavocStatement)
+                for index, candidate in enumerate(block.statements):
+                    if isinstance(candidate, preferred):
+                        block_mark_index = index
+                        break
+                if block_mark_index is None:
+                    for index, candidate in enumerate(block.statements):
+                        if isinstance(candidate, fallback):
+                            block_mark_index = index
+                            break
+            new_stmts: list[Any] = []
+            for stmt_index, stmt in enumerate(block.statements):
+                stmt_id = "proc:%s:block:%s:stmt:%s" % (
+                    decl.name,
+                    block.name,
+                    stmt_index,
+                )
+                if stmt_id in impacted_statement_ids or stmt_index == block_mark_index:
+                    new_stmts.append(marker())
+                new_stmts.append(stmt)
+            block.statements = new_stmts
+    return str(program)
+
+
+def impacted_blocks_from_llvm_match(
+    parsed: ParsedBoogieProgram,
+    side_name: str,
+    llvm_match: dict[str, Any] | None,
+) -> set[str]:
+    if not llvm_match:
+        return set()
+    wanted: set[tuple[str, str]] = set()
+    for chunk in llvm_match.get("chunks", []) or []:
+        if chunk.get("kind") == "stable":
+            continue
+        side = chunk.get(side_name) or {}
+        func = str(side.get("function") or "")
+        block = str(side.get("block") or "")
+        if func and block:
+            wanted.add((func, block))
+    if not wanted:
+        return set()
+
+    from diffprod.boogie_bridge import _boogie_classes
+
+    classes = _boogie_classes()
+    ProcedureDeclaration = classes["ProcedureDeclaration"]
+    out: set[str] = set()
+    for decl in parsed.declarations:
+        if (
+            not isinstance(decl, ProcedureDeclaration)
+            or getattr(decl, "body", None) is None
+        ):
+            continue
+        for boogie_block in decl.body.blocks:
+            text = str(boogie_block)
+            for func, llvm_block in wanted:
+                if (
+                    ('{:llvm.func "%s"}' % func) in text
+                    and ('{:llvm.bb "%s"}' % llvm_block) in text
+                ):
+                    out.add("proc:%s:block:%s" % (decl.name, boogie_block.name))
+                    break
+    return out
 
 
 def product_artifact_from_result(
@@ -483,7 +692,7 @@ def boogie_type(ty: Any, dims: int, ir: Any) -> str:
 
 def ensure_diffprod_package_on_path() -> bool:
     try:
-        from diffprod import bpl_emit  # noqa: F401
+        from diffprod import product_v2  # noqa: F401
 
         return True
     except ImportError:
@@ -491,13 +700,13 @@ def ensure_diffprod_package_on_path() -> bool:
 
     here = Path(__file__).resolve()
     for parent in here.parents:
-        candidate = parent / "diffprod" / "diffprod" / "boogie_bridge.py"
+        candidate = parent / "diffprod" / "diffprod" / "product_v2.py"
         if candidate.exists():
             package_root = str(parent / "diffprod")
             if package_root not in sys.path:
                 sys.path.insert(0, package_root)
             try:
-                from diffprod import bpl_emit  # noqa: F401
+                from diffprod import product_v2  # noqa: F401
 
                 return True
             except ImportError:

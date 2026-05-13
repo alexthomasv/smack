@@ -78,9 +78,16 @@ class OriginSet:
 
     def primary_span(self) -> SourceSpan | None:
         for record in self.records:
-            if record.source_span is not None:
+            if record.source_span is not None and record.source_span.start_line:
                 return record.source_span
         return None
+
+    def source_spans(self) -> list[SourceSpan]:
+        return [
+            record.source_span
+            for record in self.records
+            if record.source_span is not None
+        ]
 
     def llvm_insts(self) -> set[str]:
         return {
@@ -214,7 +221,9 @@ def boogie_classes() -> dict[str, Any]:
         CallStatement,
         GotoStatement,
         HavocStatement,
+        IfStatement,
         ReturnStatement,
+        WhileStatement,
     )
 
     return {
@@ -230,6 +239,7 @@ def boogie_classes() -> dict[str, Any]:
         "HavocStatement": HavocStatement,
         "Identifier": Identifier,
         "IfExpression": IfExpression,
+        "IfStatement": IfStatement,
         "IntegerLiteral": IntegerLiteral,
         "LogicalNegation": LogicalNegation,
         "MapSelect": MapSelect,
@@ -238,6 +248,7 @@ def boogie_classes() -> dict[str, Any]:
         "Program": Program,
         "ReturnStatement": ReturnStatement,
         "StorageIdentifier": StorageIdentifier,
+        "WhileStatement": WhileStatement,
     }
 
 
@@ -304,6 +315,13 @@ def build_provenance_index(declarations: list[Any]) -> ProvenanceIndex:
 
 
 def origins_for_node(node_id: str, node: Any) -> OriginSet:
+    origin = OriginSet([origin_record_for_node(node_id, node)])
+    for child in structured_statement_children(node):
+        origin.extend(origins_for_node(node_id, child))
+    return origin
+
+
+def origin_record_for_node(node_id: str, node: Any) -> OriginRecord:
     attrs = attribute_map(node)
     source_span = source_span_from_attrs(attrs)
     synthetic_reason = None
@@ -324,7 +342,26 @@ def origins_for_node(node_id: str, node: Any) -> OriginSet:
         cexpr=first(attrs.get("cexpr")),
         attributes=attrs,
     )
-    return OriginSet([record])
+    return record
+
+
+def structured_statement_children(node: Any) -> list[Any]:
+    classes = boogie_classes()
+    IfStatement = classes["IfStatement"]
+    WhileStatement = classes["WhileStatement"]
+    if not isinstance(node, (IfStatement, WhileStatement)):
+        return []
+
+    out: list[Any] = []
+    for block in getattr(node, "blocks", []) or []:
+        out.extend(getattr(block, "statements", []) or [])
+    else_part = getattr(node, "else_", None)
+    if isinstance(else_part, IfStatement):
+        out.append(else_part)
+    else:
+        for block in else_part or []:
+            out.extend(getattr(block, "statements", []) or [])
+    return out
 
 
 def attribute_map(node: Any) -> dict[str, list[str]]:

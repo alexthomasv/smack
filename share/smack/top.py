@@ -421,6 +421,13 @@ def arguments():
         help='easy diff-product interface: functions=two sources, patch=source plus diff')
 
     translate_group.add_argument(
+        '--functional-equivalence',
+        action='store_true',
+        default=False,
+        help='build a structured diff-scoped product for functional equivalence '
+             'from --source, --patch, and --entry')
+
+    translate_group.add_argument(
         '--left',
         metavar='FILE',
         default=None,
@@ -836,6 +843,17 @@ def arguments():
         args.diff_product_out = args.product_out
     if args.product_json and args.diff_product_json is None:
         args.diff_product_json = args.product_json
+
+    if args.functional_equivalence:
+        if args.product_mode is not None and args.product_mode != 'patch':
+            parser.error('--functional-equivalence cannot be combined with '
+                         '--product-mode functions')
+        args.product_mode = 'patch'
+        if not (
+            args.diff_product_structured_bpl_loops or
+            args.diff_product_structured_bpl_loops_strict
+        ):
+            args.diff_product_structured_bpl_loops = True
 
     if args.product_mode == 'functions':
         if not args.left or not args.right:
@@ -1393,7 +1411,7 @@ def run_diff_product(args):
                 diff_text = f.read()
 
         if mode == 'patch':
-            from diffprod.user_api import apply_unified_diff_to_text
+            from tools.smack_diff import apply_unified_diff_to_text
 
             with open(args.diff_left, 'r') as f:
                 left_source_text = f.read()
@@ -1636,6 +1654,9 @@ def diff_product_patched_filename(diff_text, fallback_source):
             path = path[2:]
         basename = os.path.basename(path)
         if basename:
+            if not os.path.splitext(basename)[1]:
+                _, fallback_ext = os.path.splitext(fallback_source)
+                basename += fallback_ext or ".c"
             return basename
     _, ext = os.path.splitext(fallback_source)
     return "right%s" % (ext or ".c")

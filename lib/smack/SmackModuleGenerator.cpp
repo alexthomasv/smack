@@ -14,7 +14,9 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <map>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <vector>
@@ -236,6 +238,224 @@ struct LoopPathBuilder {
     return false;
   }
 };
+
+bool hasUnsafeIncomingEdge(ProcDecl *proc, Block *target,
+                           const std::set<Block *> &allowedSources);
+void removeBlocks(ProcDecl *proc, const std::set<Block *> &removed);
+
+std::map<Block *, unsigned>
+reachableDistances(Block *start, const std::map<std::string, Block *> &blocks) {
+  std::map<Block *, unsigned> dist;
+  std::queue<Block *> todo;
+  if (!start)
+    return dist;
+  dist[start] = 0;
+  todo.push(start);
+  while (!todo.empty()) {
+    Block *cur = todo.front();
+    todo.pop();
+    auto *go = trailingGoto(cur);
+    if (!go)
+      continue;
+    for (auto &targetName : go->getTargets()) {
+      auto found = blocks.find(targetName);
+      if (found == blocks.end())
+        continue;
+      Block *target = found->second;
+      if (dist.count(target))
+        continue;
+      dist[target] = dist[cur] + 1;
+      todo.push(target);
+    }
+  }
+  return dist;
+}
+
+struct IfPathBuilder {
+  std::map<std::string, Block *> blocks;
+  Block *join;
+  std::set<Block *> used;
+  std::set<Block *> active;
+  std::string reason;
+
+  bool emit(Block *block, std::list<const Stmt *> &out) {
+    if (block == join)
+      return true;
+    if (!block) {
+      reason = "if path reaches a missing block";
+      return false;
+    }
+    if (isLoopHeader(block)) {
+      reason = "if path reaches an unstructured loop header";
+      return false;
+    }
+    if (active.count(block)) {
+      reason = "if path contains a cycle";
+      return false;
+    }
+
+    active.insert(block);
+    used.insert(block);
+
+    auto prefix = withoutTrailingGoto(block);
+    out.insert(out.end(), prefix.begin(), prefix.end());
+
+    auto *go = trailingGoto(block);
+    if (!go) {
+      active.erase(block);
+      reason = "if path falls through before reaching join";
+      return false;
+    }
+
+    if (go->getTargets().size() == 1) {
+      auto targetName = go->getTargets().front();
+      if (!blocks.count(targetName)) {
+        active.erase(block);
+        reason = "if path reaches an unknown successor";
+        return false;
+      }
+      bool ok = emit(blocks[targetName], out);
+      active.erase(block);
+      return ok;
+    }
+
+    if (go->getTargets().size() == 2) {
+      auto targetIt = go->getTargets().begin();
+      Block *thenBlock = blocks.count(*targetIt) ? blocks[*targetIt] : nullptr;
+      ++targetIt;
+      Block *elseBlock = blocks.count(*targetIt) ? blocks[*targetIt] : nullptr;
+      auto *thenPartition = thenBlock ? leadingPartition(thenBlock) : nullptr;
+      auto *elsePartition = elseBlock ? leadingPartition(elseBlock) : nullptr;
+      if (!thenBlock || !elseBlock || !thenPartition || !elsePartition) {
+        active.erase(block);
+        reason = "if branch target is missing partition metadata";
+        return false;
+      }
+
+      std::list<const Stmt *> thenStmts;
+      std::list<const Stmt *> elseStmts;
+      if (!emit(thenBlock, thenStmts) || !emit(elseBlock, elseStmts)) {
+        active.erase(block);
+        return false;
+      }
+      out.push_back(
+          Stmt::if_(thenPartition->getExpr(), thenStmts, elseStmts));
+      active.erase(block);
+      return true;
+    }
+
+    active.erase(block);
+    reason = "if path contains a multi-way branch";
+    return false;
+  }
+};
+
+bool structureIfBlock(ProcDecl *proc, Block *branch, std::string &reason) {
+  if (isLoopHeader(branch)) {
+    reason = "branch is a loop header";
+    return false;
+  }
+  if (hasInteriorGoto(branch)) {
+    reason = "branch block contains an interior goto";
+    return false;
+  }
+  auto *go = trailingGoto(branch);
+  if (!go || go->getTargets().size() != 2) {
+    reason = "block does not end in a binary branch";
+    return false;
+  }
+
+  auto blocks = blockMap(proc);
+  auto targetIt = go->getTargets().begin();
+  std::string firstName = *targetIt++;
+  std::string secondName = *targetIt;
+  if (!blocks.count(firstName) || !blocks.count(secondName)) {
+    reason = "if branch target is missing";
+    return false;
+  }
+  Block *first = blocks[firstName];
+  Block *second = blocks[secondName];
+  auto *thenPartition = leadingPartition(first);
+  auto *elsePartition = leadingPartition(second);
+  if (!thenPartition || !elsePartition) {
+    reason = "if branch target is missing partition metadata";
+    return false;
+  }
+
+  auto firstReach = reachableDistances(first, blocks);
+  auto secondReach = reachableDistances(second, blocks);
+  std::vector<std::pair<unsigned, Block *>> candidates;
+  unsigned order = 0;
+  for (auto *candidate : proc->getBlocks()) {
+    if (candidate == branch)
+      continue;
+    if (!firstReach.count(candidate) || !secondReach.count(candidate)) {
+      ++order;
+      continue;
+    }
+    unsigned score = firstReach[candidate] + secondReach[candidate] + order;
+    candidates.push_back({score, candidate});
+    ++order;
+  }
+  std::sort(
+      candidates.begin(), candidates.end(),
+      [](const std::pair<unsigned, Block *> &lhs,
+         const std::pair<unsigned, Block *> &rhs) {
+        return lhs.first < rhs.first;
+      });
+
+  for (auto &candidate : candidates) {
+    Block *join = candidate.second;
+    IfPathBuilder builder{blocks, join, {}, {}, ""};
+    std::list<const Stmt *> thenStmts;
+    std::list<const Stmt *> elseStmts;
+    if (!builder.emit(first, thenStmts) || !builder.emit(second, elseStmts)) {
+      reason = builder.reason;
+      continue;
+    }
+
+    std::set<Block *> allowedIncoming = builder.used;
+    allowedIncoming.insert(branch);
+    bool unsafe = false;
+    for (auto *used : builder.used) {
+      if (hasUnsafeIncomingEdge(proc, used, allowedIncoming)) {
+        unsafe = true;
+        reason = "if body has an incoming edge from outside the branch region";
+        break;
+      }
+    }
+    if (unsafe)
+      continue;
+
+    std::list<const Stmt *> newBranch = withoutTrailingGoto(branch);
+    newBranch.push_back(Stmt::if_(thenPartition->getExpr(), thenStmts, elseStmts));
+    newBranch.push_back(Stmt::goto_({join->getName()}));
+    branch->getStatements() = newBranch;
+    removeBlocks(proc, builder.used);
+    llvm::errs() << "SMACK structured Boogie if: " << branch->getName()
+                 << " joins " << join->getName() << "\n";
+    return true;
+  }
+
+  if (reason.empty())
+    reason = "if branch has no common join";
+  return false;
+}
+
+void structureBoogieIfs(ProcDecl *proc) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    std::vector<Block *> blocks(proc->getBlocks().begin(), proc->getBlocks().end());
+    for (auto *block : blocks) {
+      std::string reason;
+      if (structureIfBlock(proc, block, reason)) {
+        changed = true;
+        break;
+      }
+    }
+  }
+}
 
 bool hasUnsafeIncomingEdge(ProcDecl *proc, Block *target,
                            const std::set<Block *> &allowedSources) {
@@ -495,8 +715,10 @@ void SmackModuleGenerator::generateProgram(llvm::Module &M) {
         } else if (naming.get(F).find(Naming::INIT_FUNC_PREFIX) == 0)
           rep.addInitFunc(&F);
 
-        if (structuredBplLoops || structuredBplLoopsStrict)
+        if (structuredBplLoops || structuredBplLoopsStrict) {
           structureBoogieLoops(P, structuredBplLoopsStrict);
+          structureBoogieIfs(P);
+        }
       }
       SDEBUG(errs() << "Finished analyzing function: " << naming.get(F)
                     << "\n\n");
