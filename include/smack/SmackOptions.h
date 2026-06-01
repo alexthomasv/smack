@@ -29,14 +29,8 @@ public:
   static const llvm::cl::opt<bool> BitPrecisePointers;
   static const llvm::cl::opt<bool> RewriteBitwiseOps;
   static const llvm::cl::opt<bool> NoMemoryRegionSplitting;
-  static const llvm::cl::opt<std::string> MemoryPartitioner;
-  static const llvm::cl::opt<std::string> MemoryPartitionOracle;
-  static const llvm::cl::opt<bool> SVFLoopFrames;
-  static const llvm::cl::opt<bool> SVFCallFrames;
-  static const llvm::cl::opt<bool> SVFIndirectCalls;
-  static const llvm::cl::opt<std::string> SVFAnalysis;
-  static const llvm::cl::opt<std::string> SVFMemoryPartitionMode;
-  static const llvm::cl::opt<std::string> SVFExtAPI;
+  // Skip the SVF-based devirtualization pass (Devirtualize). Off by default, so
+  // indirect calls SVF resolves completely get rewritten to direct dispatch.
   static const llvm::cl::opt<bool> SkipDevirt;
   static const llvm::cl::opt<bool> NoByteAccessInference;
   static const llvm::cl::opt<bool> FloatEnabled;
