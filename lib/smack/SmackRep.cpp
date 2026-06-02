@@ -1043,7 +1043,15 @@ const Expr *SmackRep::ptrArith(const llvm::Value *p,
     if (state == GepStateKind::StructOuter) {
       auto *st = llvm::cast<StructType>(indexedType);
       auto *ci = dyn_cast<ConstantInt>(index);
-      if (!ci || !st->indexValid(ci)) {
+      // Validate the struct field index by its numeric value against the field
+      // count, NOT via StructType::indexValid(const Value*) — that overload
+      // additionally requires the index *Value* to be i32-typed, which the
+      // LLVM-21/SVF pipeline does not always preserve (field indices can arrive
+      // as i64). When indexValid() spuriously failed here, the old code fell
+      // through to advance(nullptr)+continue, which discarded the type chain and
+      // silently dropped every subsequent index's offset (e.g. x->input[i]
+      // collapsed to x->input[0]). Range-check the value directly instead.
+      if (!ci || ci->getZExtValue() >= st->getNumElements()) {
         advance(nullptr);
         continue;
       }
