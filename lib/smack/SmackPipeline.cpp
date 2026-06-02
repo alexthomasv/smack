@@ -14,6 +14,7 @@
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassInstrumentation.h"
@@ -25,6 +26,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/IPO/Internalize.h"
 #include "llvm/Transforms/Scalar/DCE.h"
@@ -65,6 +67,7 @@
 #include "utils/SimplifyInsertValue.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -78,6 +81,57 @@ namespace smack {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+// Strip llvm.lifetime.start/end markers. The LLVM inliner inserts these around an
+// inlined callee's allocas; SMACK is compiled at -O0 precisely to avoid them,
+// because they make InitUndefAllocas skip the marked allocas and collapse
+// independent uninitialized vars into one undef (a soundness bug). After our
+// SMACK_FULL_INLINE force-inline we must remove the freshly-introduced markers
+// before InitUndefAllocas runs.
+struct StripLifetimeMarkers : PassInfoMixin<StripLifetimeMarkers> {
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
+    SmallVector<Instruction *, 16> dead;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *II = dyn_cast<IntrinsicInst>(&I))
+          if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
+              II->getIntrinsicID() == Intrinsic::lifetime_end)
+            dead.push_back(II);
+    for (Instruction *I : dead)
+      I->eraseFromParent();
+    return dead.empty() ? PreservedAnalyses::all() : PreservedAnalyses::none();
+  }
+};
+
+// Whether to strip-noinline + force-inline before SVF (for context-sensitive,
+// maximally-precise regions). ON BY DEFAULT, with two safety valves:
+//   - opt-out: SMACK_NO_FULL_INLINE
+//   - size guard: a fully-inlined .bpl is multi-GB for large programs (the Rust
+//     inliner exists to avoid materializing it), so skip when the module exceeds
+//     SMACK_INLINE_MAX_INSTRS instructions (default 40000). Large benchmarks then
+//     fall back to the sound (coarse) catch-all partition — exactly today's
+//     behavior. When inlining IS done we signal DSAWrapper (SMACK_REGIONS_ON) so
+//     the precise region path only engages on the inlined, context-specific module.
+bool decideFullInline(const Module &M) {
+  if (std::getenv("SMACK_NO_FULL_INLINE"))
+    return false;
+  unsigned long instrs = 0;
+  for (const Function &F : M)
+    for (const BasicBlock &BB : F)
+      instrs += BB.size();
+  unsigned long cap = 40000;
+  if (const char *e = std::getenv("SMACK_INLINE_MAX_INSTRS"))
+    cap = std::strtoul(e, nullptr, 10);
+  if (instrs > cap) {
+    errs() << "[full-inline] SKIPPED: module has " << instrs << " instructions (> "
+           << cap << " SMACK_INLINE_MAX_INSTRS); region partition stays coarse "
+              "(catch-all)\n";
+    return false;
+  }
+  // Signal DSAWrapper to engage the precise region path on this inlined module.
+  setenv("SMACK_REGIONS_ON", "1", 1);
+  return true;
+}
 
 double elapsedMs(Clock::time_point start, Clock::time_point end) {
   return std::chrono::duration<double, std::milli>(end - start).count();
@@ -186,6 +240,33 @@ void addSmackPreBplPasses(Module &module, legacy::PassManager &passManager,
   configureModule(module, options);
   initializeSmackPipelinePasses();
 
+  // [FULL-INLINE BEFORE SVF — opt-in via SMACK_FULL_INLINE]
+  // The -O0 C compile marks EVERY function `noinline`, so the build's
+  // `opt -inline-threshold=1000000` is a near no-op and SVF analyzes a
+  // non-inlined module. There, context-insensitive Andersen must merge every
+  // buffer a shared `noinline` byte-helper (U32TO8/sodium_memzero/…) touches —
+  // collapsing the region partition. Stripping `noinline` + force-inlining every
+  // non-entry function into the entrypoint gives SVF a context-SPECIFIC view (the
+  // precision sea-dsa got from BU/TD cloning). SMACK then emits the .bpl from this
+  // same inlined module, so region indices stay consistent. Gated because a fully
+  // inlined .bpl is huge for large programs (the Rust inliner in tools/build_swcp
+  // exists to avoid materializing it) — enable only for small benchmarks.
+  const bool fullInline = decideFullInline(module);
+  if (fullInline) {
+    unsigned nMarked = 0, nDef = 0;
+    for (Function &F : module)
+      if (!F.isDeclaration()) {
+        ++nDef;
+        if (!SmackOptions::isEntryPoint(F.getName())) {
+          F.removeFnAttr(Attribute::NoInline);
+          F.addFnAttr(Attribute::AlwaysInline);
+          ++nMarked;
+        }
+      }
+    errs() << "[full-inline] marked " << nMarked << " / " << nDef
+           << " defined functions alwaysinline\n";
+  }
+
   // RustFixes + the non-modular internalize/GlobalDCE/DCE cleanup run here as a
   // one-shot NewPM step rather than as legacy passes. LLVM 21 dropped the legacy
   // createGlobalDCEPass() factory (only the NewPM GlobalDCEPass survives), so the
@@ -226,7 +307,24 @@ void addSmackPreBplPasses(Module &module, legacy::PassManager &passManager,
       MPM.addPass(createModuleToFunctionPassAdaptor(DCEPass()));
     }
 
+    // Force-inline every AlwaysInline-marked (non-entry) function into the
+    // entrypoint, then GlobalDCE the now-dead callees, so SVF and SMACK emission
+    // both see one inlined function. AlwaysInliner inlines transitively.
+    if (fullInline) {
+      MPM.addPass(AlwaysInlinerPass());
+      MPM.addPass(GlobalDCEPass());
+    }
+
     MPM.run(module, MAM);
+
+    if (fullInline) {
+      unsigned nDef = 0;
+      for (Function &F : module)
+        if (!F.isDeclaration())
+          ++nDef;
+      errs() << "[full-inline] defined functions after AlwaysInliner: " << nDef
+             << "\n";
+    }
   }
 
   if (!options.modular)
@@ -413,6 +511,24 @@ void runSmackFullNewPM(Module &module, raw_ostream &out,
                        SmackPipelineReport *report) {
   configureModule(module, options);
 
+  // [FULL-INLINE BEFORE SVF — opt-in via SMACK_FULL_INLINE] See the rationale in
+  // addSmackPreBplPasses. This NewPM path (SMACK_NEW_PM build) is the one llvm2bpl
+  // actually uses for bpl emission, so the strip+inline must live here too: mark
+  // every non-entry defined function AlwaysInline now (mutates the module before
+  // the MPM runs), and add AlwaysInliner+GlobalDCE to the MPM below so SVF and the
+  // BplFilePrinter both see one inlined function.
+  const bool fullInline = decideFullInline(module);
+  if (fullInline) {
+    unsigned nMarked = 0;
+    for (Function &F : module)
+      if (!F.isDeclaration() && !SmackOptions::isEntryPoint(F.getName())) {
+        F.removeFnAttr(Attribute::NoInline);
+        F.addFnAttr(Attribute::AlwaysInline);
+        ++nMarked;
+      }
+    errs() << "[full-inline] marked " << nMarked << " functions alwaysinline\n";
+  }
+
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
   CGSCCAnalysisManager CGAM;
@@ -464,6 +580,18 @@ void runSmackFullNewPM(Module &module, raw_ostream &out,
     MPM.addPass(createModuleToFunctionPassAdaptor(DCEPass()));
     MPM.addPass(RemoveDeadDefsNewPM());
   }
+
+  // Force-inline every AlwaysInline-marked (non-entry) function into the
+  // entrypoint, then GlobalDCE the now-dead callees — before any SVF/DSA-dependent
+  // pass — so the region partition is computed on the inlined (context-specific)
+  // module. AlwaysInliner inlines transitively. Strip the lifetime markers the
+  // inliner introduces (InitUndefAllocas soundness — see StripLifetimeMarkers).
+  if (fullInline) {
+    MPM.addPass(AlwaysInlinerPass());
+    MPM.addPass(GlobalDCEPass());
+    MPM.addPass(createModuleToFunctionPassAdaptor(StripLifetimeMarkers()));
+  }
+
   {
     FunctionPassManager FPM;
     FPM.addPass(InitUndefAllocasNewPM());

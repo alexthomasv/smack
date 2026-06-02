@@ -39,6 +39,16 @@ static SVF::LLVMModuleSet *g_svfModuleSet = nullptr;
 static SVF::SVFIR *g_svfIR = nullptr;
 static SVF::Andersen *g_svfAndersen = nullptr;
 
+// Synthetic union-find id for the opt-in scoped external region. Chosen far
+// above any real SVF NodeID (object counts are in the thousands), so it never
+// collides with a genuine object node.
+static const unsigned kExternalId = 0xF0000000u;
+
+// Base for synthetic union-find ids of pointer formal parameters (DSA-style
+// formal<->actual binding). Distinct from real SVF NodeIDs (thousands) and from
+// kExternalId; room for ~256M formals before reaching kExternalId.
+static const unsigned kFormalBase = 0xE0000000u;
+
 unsigned DSAWrapper::ufFind(unsigned x) {
   auto it = ufParent.find(x);
   if (it == ufParent.end()) {
@@ -139,6 +149,65 @@ static bool isRoConstData(const llvm::Value *p) {
     }
     return false;
   }
+}
+
+// True if v provably originates from a function parameter (seen through the -O0
+// alloca spill slot) — i.e. an out-of-module-supplied pointer. Used ONLY in
+// combination with v having empty SVF points-to: such a pointer's object is
+// created by a caller outside the analyzed call tree, so it cannot be an
+// interior alloca/malloc (SVF would have resolved it otherwise). That makes it
+// sound to route it to the shared external region instead of fusing the heap.
+static bool isEntryFn(const llvm::Function *F) {
+  llvm::StringRef n = F->getName();
+  return n.contains("wrapper") || n == "main" || n.starts_with("__SMACK") ||
+         n.starts_with("__VERIFIER");
+}
+
+// True iff EVERY underlying object of `v` is a pointer parameter of an entry
+// function (and there is at least one). llvm::getUnderlyingObjects (PLURAL)
+// follows PHI/select/GEP chains that the single-value underlyingThroughSpill
+// misses; we additionally peek through -O0 spill slots per root. Used ONLY for a
+// ∅-points-to pointer: an entry-fn parameter buffer has no in-call-tree
+// allocation site, so it provably cannot alias an interior SVF object (SVF would
+// have resolved that) — routing such a pointer to the shared external region is
+// merge-only (sound). If ANY root is not an entry-fn parameter (an alloca /
+// global / loaded-ptr / call-result / inttoptr, or an Argument of a non-entry
+// function), bail: it might alias interior memory.
+static bool allRootsAreEntryParams(const llvm::Value *v) {
+  if (!v || !v->getType()->isPointerTy())
+    return false;
+  llvm::SmallVector<const llvm::Value *, 8> roots;
+  llvm::getUnderlyingObjects(v, roots);
+  if (roots.empty())
+    return false;
+  for (const llvm::Value *r : roots) {
+    const llvm::Value *base = underlyingThroughSpill(r);
+    auto *arg = base ? llvm::dyn_cast<llvm::Argument>(base) : nullptr;
+    if (!arg || !arg->getParent() || !isEntryFn(arg->getParent()))
+      return false;
+  }
+  return true;
+}
+
+// True iff EVERY underlying object of `v` is null or undef — a pointer that
+// provably cannot alias any allocated buffer, so a ∅ access through it is benign
+// (it need not share a region with any real buffer). Catches the guarded-dead
+// gep(null, N) reads the inliner exposes (e.g. chacha_ivsetup's NULL-counter
+// `if(counter)` branch, killed by `icmp eq null,null`) that would otherwise trip
+// the catch-all even though they never execute and touch no real memory.
+static bool allRootsNullOrUndef(const llvm::Value *v) {
+  if (!v || !v->getType()->isPointerTy())
+    return false;
+  llvm::SmallVector<const llvm::Value *, 8> roots;
+  llvm::getUnderlyingObjects(v, roots);
+  if (roots.empty())
+    return false;
+  for (const llvm::Value *r : roots) {
+    const llvm::Value *s = r->stripPointerCasts();
+    if (!isa<llvm::ConstantPointerNull>(s) && !isa<llvm::UndefValue>(s))
+      return false;
+  }
+  return true;
 }
 
 void DSAWrapper::computeReachable(llvm::Module &M) {
@@ -306,10 +375,14 @@ void DSAWrapper::buildUnionFind(llvm::Module &M) {
   objs.reserve(ufParent.size());
   for (auto &kv : ufParent)
     objs.push_back(kv.first);
-  for (unsigned o : objs)
-    if (pag->hasGNode(o))
-      if (const SVF::BaseObjVar *bo = pag->getBaseObject(o))
-        ufUnite(o, bo->getId());
+  // [EXPERIMENT SMACK_FIELD_SENSITIVE] skip the field->base collapse to keep
+  // SVF's field-sensitivity (more regions). Unsound for whole-buffer-annotated
+  // objects; gated for measurement.
+  if (!std::getenv("SMACK_FIELD_SENSITIVE"))
+    for (unsigned o : objs)
+      if (pag->hasGNode(o))
+        if (const SVF::BaseObjVar *bo = pag->getBaseObject(o))
+          ufUnite(o, bo->getId());
 
   // SOUND CATCH-ALL. A LIVE mem-op pointer that SVF left unresolved (no region)
   // may alias ANY object; the split-memory invariant (may-alias => same region)
@@ -319,6 +392,231 @@ void DSAWrapper::buildUnionFind(llvm::Module &M) {
   // exists, collapse the whole partition into a single universal region. This is
   // the only sound treatment — there is no flag to turn it off.
   computeReachable(M);
+
+  // [DSA-FAITHFUL INTERPROCEDURAL BINDING — opt-in via SMACK_EXTERNAL_REGION]
+  // Reconstruct what sea-dsa did and SVF's Andersen drops for -O0 spill-slot
+  // args: context-insensitive formal<->actual unification. Give every pointer
+  // FORMAL parameter a synthetic union-find node and, at every LIVE call site
+  // (direct AND indirect), unite that node with the REGION OF THE ACTUAL
+  // argument. A formal may alias any of its actuals, so uniting is sound
+  // (may-alias => same region). Transitivity is automatic in the union-find: a
+  // formal whose actual is itself a formal chains through to the eventual object
+  // (a caller alloca, or an entry-param external buffer). This is the piece that
+  // lets internal-function ∅ pointers (chacha state, etc.) inherit the RIGHT
+  // region — instead of being severed (the naive externalizer's bug) or
+  // collapsed (the catch-all). Entry-function pointer params + mutable globals
+  // still share ONE external region (they may alias each other in-place / point
+  // into a global). A pointer STILL ∅ after this (base neither a formal nor
+  // resolved) trips the universal catch-all below.
+  // Engage the precise region path when SmackPipeline force-inlined the module
+  // (SMACK_REGIONS_ON), or on manual override (SMACK_EXTERNAL_REGION). On a
+  // non-inlined module (large benchmark, inline size-guarded off) this stays off
+  // and the sound catch-all below produces the coarse partition — today's default.
+  if (std::getenv("SMACK_REGIONS_ON") || std::getenv("SMACK_EXTERNAL_REGION")) {
+    auto formalNode = [&](const llvm::Argument *a) -> unsigned {
+      auto it = formalNodeId.find(a);
+      if (it != formalNodeId.end())
+        return it->second;
+      unsigned id = kFormalBase + (unsigned)formalNodeId.size();
+      formalNodeId[a] = id;
+      ufFind(id);
+      return id;
+    };
+    auto uniteObjs = [&](unsigned node, const llvm::Value *p) -> bool {
+      if (!p || !ms->hasValueNode(p))
+        return false;
+      const SVF::PointsTo &pts = ander->getPts(ms->getValueNode(p));
+      bool any = false;
+      for (SVF::NodeID o : pts) {
+        ufUnite(node, o);
+        any = true;
+      }
+      return any;
+    };
+
+    // Per-param ON by default (opt-out SMACK_NO_PER_PARAM): each entry buffer its
+    // own region. Sound by the same may-alias⇒same-region invariant — the graft
+    // below merges any two params whose accesses SVF resolves to a shared object
+    // (e.g. the in-place xor in/out pair), so only provably-distinct buffers (the
+    // secret key, AD, nonce …) actually separate. Byte-match is the per-benchmark
+    // gate, modulo SVF points-to completeness.
+    perParam = std::getenv("SMACK_NO_PER_PARAM") == nullptr;
+
+    // External region(s): every mutable global goes into one shared externalRoot
+    // (read-only constant globals are benign and excluded). Track whether any
+    // mutable global exists — if so, per-param mode must conservatively fold the
+    // params back in (a param may alias a global), since SVF gives entry params ∅.
+    externalRoot = kExternalId;
+    ufFind(externalRoot);
+    bool hasGlobals = false;
+    for (llvm::GlobalVariable &G : M.globals()) {
+      if (G.isConstant() || !ms->hasValueNode(&G))
+        continue;
+      const SVF::PointsTo &gp = ander->getPts(ms->getValueNode(&G));
+      for (SVF::NodeID o : gp) {
+        ufUnite(externalRoot, o);
+        hasGlobals = true;
+      }
+    }
+    // Entry-fn pointer params: each gets a formal node. Shared mode (or per-param
+    // with mutable globals present) folds them all into externalRoot; per-param
+    // without globals keeps each param its OWN region (sea-dsa formal cells).
+    for (llvm::Function &F : M) {
+      if (F.isDeclaration() || !isEntryFn(&F))
+        continue;
+      for (llvm::Argument &a : F.args())
+        if (a.getType()->isPointerTy()) {
+          unsigned fn = formalNode(&a);
+          if (!perParam || hasGlobals)
+            ufUnite(fn, externalRoot);
+        }
+    }
+    // Keep each formal's synthetic node coincident with its OWN resolved region
+    // (when SVF did resolve the formal) so the binding never splits it.
+    for (llvm::Function &F : M)
+      for (llvm::Argument &a : F.args())
+        if (a.getType()->isPointerTy())
+          uniteObjs(formalNode(&a), &a);
+
+    // Bind formal<->actual at every LIVE call site (direct + SVF-resolved
+    // indirect). For each pointer arg: unite the callee formal's node with the
+    // actual's region — its points-to if resolved, else its underlying object's
+    // points-to, else (actual is itself a formal) the actual's formal node.
+    auto bindCall = [&](llvm::CallBase *CB, llvm::Function *callee) {
+      if (!callee || callee->isDeclaration())
+        return;
+      unsigned nn = CB->arg_size() < callee->arg_size() ? CB->arg_size()
+                                                        : callee->arg_size();
+      for (unsigned i = 0; i < nn; ++i) {
+        const llvm::Value *actual = CB->getArgOperand(i);
+        const llvm::Argument *formal = callee->getArg(i);
+        if (!actual->getType()->isPointerTy() ||
+            !formal->getType()->isPointerTy())
+          continue;
+        unsigned fn = formalNode(formal);
+        if (uniteObjs(fn, actual))
+          continue;
+        const llvm::Value *abase = underlyingThroughSpill(actual);
+        if (uniteObjs(fn, abase))
+          continue;
+        if (auto *aarg = llvm::dyn_cast_or_null<llvm::Argument>(abase))
+          ufUnite(fn, formalNode(aarg)); // actual is another formal — chain
+      }
+    };
+    for (llvm::Function &F : M) {
+      if (!reachableFuncs.count(&F))
+        continue;
+      for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
+        auto *CB = dyn_cast<llvm::CallBase>(&*I);
+        if (!CB || CB->isInlineAsm())
+          continue;
+        if (auto *cf = CB->getCalledFunction())
+          bindCall(CB, cf);
+        else if (CB->getCalledOperand() &&
+                 ms->hasValueNode(CB->getCalledOperand())) {
+          if (auto *cn = ms->getCallICFGNode(CB))
+            if (ander->hasIndCSCallees(cn))
+              for (const SVF::FunObjVar *fo : ander->getIndCSCallees(cn))
+                bindCall(CB, M.getFunction(fo->getName()));
+        }
+      }
+    }
+    // TOTALITY GRAFT (sea-dsa "all cells of a buffer ⇒ one node"). A mem-op
+    // pointer whose spill-aware underlying object is an entry param MAY alias that
+    // param's buffer, so whatever SVF independently resolved it to must share the
+    // buffer's region — fold its points-to objects into externalRoot. Fixes the
+    // split where a loop-advanced output pointer (a PHI SVF resolves to an interior
+    // object) lands in a different region than the buffer's __SMACK_values
+    // annotation. Sound (may-alias ⇒ same region); coarsens only the entry buffers.
+    auto foldEntryDerived = [&](const llvm::Value *p) {
+      if (!p || !p->getType()->isPointerTy() || !ms->hasValueNode(p))
+        return;
+      llvm::SmallVector<const llvm::Value *, 8> roots;
+      llvm::getUnderlyingObjects(p, roots);
+      // Collect this access's entry-param region rep: in per-param mode the union
+      // of the formal nodes of its entry-param roots (so an access spanning >1
+      // param merges those params — they may-alias); in shared mode externalRoot.
+      unsigned rep = 0;
+      bool entry = false;
+      for (auto *r : roots) {
+        const llvm::Value *b = underlyingThroughSpill(r);
+        if (auto *a = llvm::dyn_cast_or_null<llvm::Argument>(b))
+          if (a->getParent() && isEntryFn(a->getParent())) {
+            unsigned node = perParam ? formalNode(a) : externalRoot;
+            if (!entry) {
+              rep = node;
+              entry = true;
+            } else
+              ufUnite(rep, node);
+          }
+      }
+      if (!entry)
+        return;
+      const SVF::PointsTo &pts = ander->getPts(ms->getValueNode(p));
+      for (SVF::NodeID o : pts)
+        ufUnite(rep, o);
+    };
+    for (auto &F : M) {
+      if (!reachableFuncs.count(&F))
+        continue;
+      for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
+        if (auto *L = dyn_cast<LoadInst>(&*I))
+          foldEntryDerived(L->getPointerOperand());
+        else if (auto *S = dyn_cast<StoreInst>(&*I))
+          foldEntryDerived(S->getPointerOperand());
+        else if (auto *MI = dyn_cast<MemIntrinsic>(&*I)) {
+          foldEntryDerived(MI->getRawDest());
+          if (auto *MT = dyn_cast<MemTransferInst>(MI))
+            foldEntryDerived(MT->getRawSource());
+        }
+      }
+    }
+    valueRootPlus1.clear(); // 0s cached during seeding are now stale
+    llvm::errs() << "[svf-region] DSA-STYLE BINDING engaged: formal<->actual "
+                    "unification ("
+                 << formalNodeId.size() << " pointer formals bound)\n";
+
+    if (std::getenv("SMACK_DEBUG_BIND")) {
+      unsigned er = ufFind(externalRoot);
+      // Count real stack/heap objects sharing the external root (interior
+      // absorbed into external = the over-merge bug).
+      unsigned interiorInExternal = 0, totalInterior = 0;
+      std::set<unsigned> roots;
+      for (auto &kv : ufParent) {
+        unsigned o = kv.first;
+        if (!pag->hasGNode(o))
+          continue;
+        const SVF::BaseObjVar *bo = pag->getBaseObject(o);
+        if (!bo)
+          continue;
+        roots.insert(ufFind(o));
+        if (bo->isStack() || bo->isHeap()) {
+          ++totalInterior;
+          if (ufFind(o) == er)
+            ++interiorInExternal;
+        }
+      }
+      llvm::errs() << "[BIND-DBG] distinct real-object roots=" << roots.size()
+                   << "  interior(stack/heap) objs=" << totalInterior
+                   << "  interiorMergedIntoExternal=" << interiorInExternal
+                   << "\n";
+      // Per pointer-formal: does it land in the external region?
+      std::map<std::string, std::pair<unsigned, unsigned>> perFn; // fn -> (ext,total)
+      for (auto &kv : formalNodeId) {
+        auto *a = llvm::dyn_cast<llvm::Argument>(kv.first);
+        if (!a)
+          continue;
+        auto &pr = perFn[a->getParent()->getName().str()];
+        pr.second++;
+        if (ufFind(kv.second) == er)
+          pr.first++;
+      }
+      for (auto &kv : perFn)
+        llvm::errs() << "[BIND-DBG] fn=" << kv.first << " formals_in_external="
+                     << kv.second.first << "/" << kv.second.second << "\n";
+    }
+  }
+
   // Must check the SAME mem-op pointer set as the SMACK_AUDIT_REGION_SOUNDNESS
   // audit (load/store ptr + memcpy dest AND source), else the audit could flag a
   // live unresolved pointer the trigger missed.
@@ -327,8 +625,60 @@ void DSAWrapper::buildUnionFind(llvm::Module &M) {
       return false;
     const llvm::Value *s = addr->stripPointerCasts();
     return !(isa<ConstantPointerNull>(s) || isa<UndefValue>(s) ||
-             isRoConstData(addr));
+             isRoConstData(addr) || allRootsNullOrUndef(addr));
   };
+  if (std::getenv("SMACK_DEBUG_CATCHALL")) {
+    auto kind = [](const llvm::Value *p) -> const char * {
+      const llvm::Value *s = p->stripPointerCasts();
+      if (isa<AllocaInst>(s)) return "alloca";
+      if (isa<Argument>(s)) return "arg";
+      if (isa<GetElementPtrInst>(s)) return "gep";
+      if (isa<LoadInst>(s)) return "load";
+      if (isa<PHINode>(s)) return "phi";
+      if (isa<SelectInst>(s)) return "select";
+      if (isa<CallBase>(s)) return "call";
+      return "other";
+    };
+    unsigned shown = 0, total = 0;
+    auto probe = [&](const llvm::Value *p, const char *k, const llvm::Function *F) {
+      if (!isLiveUnresolved(p))
+        return;
+      ++total;
+      if (shown++ >= 40)
+        return;
+      llvm::SmallVector<const llvm::Value *, 8> roots;
+      llvm::getUnderlyingObjects(p, roots);
+      std::string rs;
+      for (const llvm::Value *r : roots) {
+        rs += kind(r);
+        rs += " ";
+      }
+      std::string ptxt;
+      llvm::raw_string_ostream os(ptxt);
+      p->print(os);
+      llvm::errs() << "[CATCHALL] fn=" << F->getName() << " " << k
+                   << " entryParams=" << allRootsAreEntryParams(p)
+                   << " nRoots=" << roots.size() << " roots={ " << rs << "} "
+                   << os.str() << "\n";
+    };
+    for (auto &F : M) {
+      if (!reachableFuncs.count(&F))
+        continue;
+      for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
+        if (auto *L = dyn_cast<LoadInst>(&*I))
+          probe(L->getPointerOperand(), "load", &F);
+        else if (auto *S = dyn_cast<StoreInst>(&*I))
+          probe(S->getPointerOperand(), "store", &F);
+        else if (auto *MI = dyn_cast<MemIntrinsic>(&*I)) {
+          probe(MI->getRawDest(), "memintr-dst", &F);
+          if (auto *MT = dyn_cast<MemTransferInst>(MI))
+            probe(MT->getRawSource(), "memintr-src", &F);
+        }
+      }
+    }
+    llvm::errs() << "[CATCHALL] total live-unresolved = " << total << "\n";
+  }
+
   bool liveUnresolved = false;
   for (auto &F : M) {
     if (!reachableFuncs.count(&F))
@@ -486,13 +836,13 @@ void DSAWrapper::aggregateRegions() {
   for (auto &kv : ufParent)
     objs.push_back(kv.first);
 
+  // Pass 1: REAL SVF objects set their region's properties.
   for (unsigned obj : objs) {
+    if (!pag->hasGNode(obj))
+      continue; // synthetic (formal / external) node — handled in pass 2
     unsigned root = ufFind(obj);
     RegionInfo &ri = regionInfo[root];
-    const SVF::BaseObjVar *bo = nullptr;
-    // getBaseObject is valid for object nodes (FI and Gep); guard defensively.
-    if (pag->hasGNode(obj))
-      bo = pag->getBaseObject(obj);
+    const SVF::BaseObjVar *bo = pag->getBaseObject(obj);
     if (!bo) {
       ri.complicated = true;
       ri.incomplete = true;
@@ -515,6 +865,22 @@ void DSAWrapper::aggregateRegions() {
     }
     if (memOpdObjs.count(obj))
       ri.memOpd = true;
+  }
+  // Pass 2: synthetic formal/external nodes. A formal bound to a real object
+  // lives in that object's (already-populated) region — do NOT mark it
+  // complicated/incomplete, which would needlessly coarsen the interior. Only a
+  // synthetic node whose component has NO real object (a formal that never
+  // reached a concrete object, or the bare external region) is genuinely
+  // unknown ⇒ conservative.
+  for (unsigned obj : objs) {
+    if (pag->hasGNode(obj))
+      continue;
+    unsigned root = ufFind(obj);
+    RegionInfo &ri = regionInfo[root];
+    if (!ri.allocated && ri.numGlobals == 0) {
+      ri.complicated = true;
+      ri.incomplete = true;
+    }
   }
 }
 
@@ -555,6 +921,72 @@ bool DSAWrapper::runOnModule(llvm::Module &M) {
 
   buildUnionFind(M);
   aggregateRegions();
+
+  // The scoped external region models out-of-module buffers: externally
+  // allocated and conservatively modified. Force these — its synthetic node has
+  // no SVF base object, so aggregateRegions only marked it incomplete/complicated
+  // (via the no-base branch); allocated in particular must be set so the region
+  // is treated as live memory that calls/writes may modify.
+  if (externalRoot) {
+    RegionInfo &ri = regionInfo[ufFind(externalRoot)];
+    ri.allocated = true;
+    ri.incomplete = true;
+    ri.complicated = true;
+  }
+
+  // [DIAGNOSTIC, env SMACK_DEBUG_SPLIT] For each entry-fn pointer Argument, collect
+  // the distinct regions (rootPlus1) of every mem-op pointer / __SMACK_values arg
+  // whose spill-aware underlying object is that Argument. >1 distinct region == the
+  // buffer is split across regions (the soundness bug the byte-match caught).
+  if (std::getenv("SMACK_DEBUG_SPLIT")) {
+    std::map<const llvm::Argument *, std::map<unsigned, std::string>> ar;
+    auto note = [&](const llvm::Value *p, const char *kind) {
+      if (!p || !p->getType()->isPointerTy())
+        return;
+      llvm::SmallVector<const llvm::Value *, 8> roots;
+      llvm::getUnderlyingObjects(p, roots);
+      for (auto *r : roots) {
+        const llvm::Value *b = underlyingThroughSpill(r);
+        if (auto *a = llvm::dyn_cast_or_null<llvm::Argument>(b))
+          if (a->getParent() && isEntryFn(a->getParent()) &&
+              p->getType()->isPointerTy()) {
+            unsigned reg = rootPlus1(p);
+            if (!ar[a].count(reg)) {
+              std::string s;
+              llvm::raw_string_ostream os(s);
+              p->print(os);
+              ar[a][reg] = std::string(kind) + " " + os.str();
+            }
+          }
+      }
+    };
+    for (auto &F : M)
+      for (auto &BB : F)
+        for (auto &I : BB) {
+          if (auto *L = dyn_cast<LoadInst>(&I))
+            note(L->getPointerOperand(), "load");
+          else if (auto *S = dyn_cast<StoreInst>(&I))
+            note(S->getPointerOperand(), "store");
+          else if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
+            note(MI->getRawDest(), "memdst");
+            if (auto *MT = dyn_cast<MemTransferInst>(MI))
+              note(MT->getRawSource(), "memsrc");
+          } else if (auto *CB = dyn_cast<CallBase>(&I)) {
+            if (auto *cf = CB->getCalledFunction())
+              if (cf->getName().contains("__SMACK_value") && CB->arg_size() > 0)
+                note(CB->getArgOperand(0), "smackvalue");
+          }
+        }
+    for (auto &kv : ar) {
+      llvm::errs() << "[SPLIT] " << kv.first->getParent()->getName() << " arg%"
+                   << kv.first->getArgNo() << " -> " << kv.second.size()
+                   << " distinct region(s):";
+      for (auto &rk : kv.second)
+        llvm::errs() << "  root+1=" << rk.first << "{" << rk.second.substr(0, 46)
+                     << "}";
+      llvm::errs() << "\n";
+    }
+  }
 
   // Soundness audit (opt-in): every load/store/mem-intrinsic pointer that gets
   // NO region (empty SVF points-to) is isolated from all real buffers — sound
@@ -743,8 +1175,9 @@ bool DSAWrapper::runOnModule(llvm::Module &M) {
       unsigned r = rootPlus1(p);
       if (r == 0) { // C2: no region
         const llvm::Value *s = p->stripPointerCasts();
-        if (isa<ConstantPointerNull>(s) || isa<UndefValue>(s) || roConst(p))
-          return; // benign
+        if (isa<ConstantPointerNull>(s) || isa<UndefValue>(s) || roConst(p) ||
+            allRootsNullOrUndef(p))
+          return; // benign (null/undef-derived ⇒ aliases no real buffer)
         if (!reachable.count(F)) {
           ++deadC2; // dead code — never executes, benign
           return;
@@ -847,6 +1280,54 @@ unsigned DSAWrapper::rootPlus1(const llvm::Value *v) {
         result = ufFind(*bpts.begin()) + 1;
     }
   }
+  // DSA-style formal binding (opt-in): a ∅ pointer derived from a formal
+  // parameter inherits that formal's bound region (united with its actual args
+  // at every call site). Places internal-function pointers in the SAME region as
+  // the object their data actually comes from — sound (the formal may alias the
+  // actual), and the piece SVF's Andersen left empty for -O0 spill slots. Checked
+  // before the catch-all so it pre-empts it for the pointers it can soundly place.
+  if (!formalNodeId.empty() && result == 0 && v) {
+    const llvm::Value *base = underlyingThroughSpill(v);
+    if (auto *a = llvm::dyn_cast_or_null<llvm::Argument>(base)) {
+      auto it = formalNodeId.find(a);
+      if (it != formalNodeId.end())
+        result = ufFind(it->second) + 1;
+    }
+  }
+
+  // Robust entry-parameter routing (opt-in): a ∅ pointer whose ALL underlying
+  // objects are entry-function parameters (via getUnderlyingObjects, which
+  // follows the PHI/select/GEP chains the single-value walk above misses)
+  // provably cannot alias interior memory, so it maps to the shared external
+  // region. Catches the entry-buffer accesses the formal-binding step could not
+  // trace — the residual live-∅ pointers that otherwise trip the catch-all.
+  if (result == 0 && v && allRootsAreEntryParams(v)) {
+    if (perParam) {
+      // Per-param: route to the merged formal node of v's entry-param roots.
+      llvm::SmallVector<const llvm::Value *, 8> roots;
+      llvm::getUnderlyingObjects(v, roots);
+      unsigned rep = 0;
+      bool have = false;
+      for (auto *r : roots) {
+        const llvm::Value *b = underlyingThroughSpill(r);
+        if (auto *a = llvm::dyn_cast_or_null<llvm::Argument>(b)) {
+          auto it = formalNodeId.find(a);
+          if (it != formalNodeId.end()) {
+            if (!have) {
+              rep = it->second;
+              have = true;
+            } else
+              ufUnite(rep, it->second);
+          }
+        }
+      }
+      if (have)
+        result = ufFind(rep) + 1;
+    } else if (externalRoot) {
+      result = ufFind(externalRoot) + 1;
+    }
+  }
+
   // SOUND catch-all: once collapsed, a still-unresolved (non-benign) pointer
   // maps to the single universal region — it may alias anything, and everything
   // resolved was already united into that region. (Resolved pointers reach here

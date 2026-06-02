@@ -80,6 +80,29 @@ private:
   bool collapsed = false;
   unsigned collapsedRoot = 0;
 
+  // Scoped alternative to the universal collapse (opt-in: SMACK_EXTERNAL_REGION).
+  // A single shared "external" region holding every PROVABLY boundary-derived
+  // unresolved pointer (one whose underlying object is a function parameter, i.e.
+  // supplied by an out-of-module caller and therefore not an interior
+  // alloca/malloc) plus every mutable global. Boundary buffers share ONE region
+  // (in-place aliasing stays sound) while interior objects keep their precise
+  // SVF regions. 0 == not engaged.
+  unsigned externalRoot = 0;
+
+  // DSA-style interprocedural binding: a synthetic union-find node per pointer
+  // FORMAL parameter, united with the region of its actual argument at every
+  // call site (formal may alias actual ⇒ same region — sound). Lets internal
+  // ∅-points-to pointers (SVF couldn't track the -O0 spill-slot arg flow) inherit
+  // the right region instead of collapsing or severing. const Value* -> node id.
+  std::map<const llvm::Value *, unsigned> formalNodeId;
+
+  // Per-entry-param regions (opt-in SMACK_PER_PARAM): give each entry-function
+  // pointer parameter its OWN region (sea-dsa's distinct formal-arg cells) instead
+  // of folding them all into one shared external region. Separates the secret key
+  // from the public I/O buffers. Sound for the verified harness (distinct buffers);
+  // byte-match is the gate. Off ⇒ the validated single-external-region behavior.
+  bool perParam = false;
+
   void buildUnionFind(llvm::Module &M);
   void aggregateRegions();
   // Returns component root + 1 for the region of pointer v, or 0 if none.
