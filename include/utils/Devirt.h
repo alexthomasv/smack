@@ -55,13 +55,28 @@ private:
   std::vector<CallBase *> Worklist;
 
   // A cache of indirect-call bounce functions that have been built already.
-  std::map<const Function *, std::set<const Function *>> bounceCache;
+  // The bool records the fallback kind: true = FLTA bounce whose no-match
+  // branch performs the residual indirect call (unknown-callee model); false =
+  // completeness-gated bounce whose no-match branch is `unreachable`. The two
+  // are semantically different and must never be conflated by the cache.
+  struct BounceInfo {
+    std::set<const Function *> targets;
+    bool unknownFallback = false;
+  };
+  std::map<const Function *, BounceInfo> bounceCache;
+
+  // Functions enumerated as FLTA fallback targets. The dead-function stubber
+  // must treat these as live roots: the bounce dispatches to them on a
+  // dynamically taken edge SVF's call graph does not contain.
+  std::set<const Function *> fltaTargets;
 
 protected:
-  void makeDirectCall(CallBase *CS);
-  Function *buildBounce(CallBase *CS, std::vector<const Function *> &Targets);
+  void makeDirectCall(CallBase *CS, bool allowFlta);
+  Function *buildBounce(CallBase *CS, std::vector<const Function *> &Targets,
+                        bool unknownFallback);
   const Function *findInCache(const CallBase *CS,
-                              std::set<const Function *> &Targets);
+                              std::set<const Function *> &Targets,
+                              bool unknownFallback);
 
 public:
   static char ID;

@@ -776,6 +776,22 @@ void SmackModuleGenerator::generateProgramImpl(
         proc->getModifies().push_back(mod);
   }
 
+  // Unknown-callee procedures (indirect calls devirt could not resolve) get
+  // the same conservative modifies-all as external declarations: the unknown
+  // function may write any region. Declared here, after body generation, so
+  // the memory-map list is complete.
+  for (auto *proc : rep.unknownIndirectCallProcs()) {
+    for (const auto &mod : allMemoryMaps)
+      proc->getModifies().push_back(mod);
+    decls.insert(decls.end(), proc);
+  }
+
+  // Const-region axioms (-smack-const-regions): each fixes one cell of a
+  // constant-global `const` map (load(M,addr)==val), replacing the elided
+  // __SMACK_static_init stores. Collected during body generation above.
+  for (const Expr *ax : rep.constRegionAxioms())
+    decls.insert(decls.end(), Decl::axiom(ax));
+
   auto ds = rep.auxiliaryDeclarations();
   decls.insert(decls.end(), ds.begin(), ds.end());
   decls.insert(decls.end(), rep.getInitFuncs());

@@ -20,6 +20,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cstdlib>
 #include <list>
 #include <queue>
 #include <set>
@@ -344,17 +345,22 @@ const Stmt *SmackRep::alloca(llvm::AllocaInst &i) {
 }
 
 const Stmt *SmackRep::memcpy(const llvm::MemCpyInst &mci) {
-  unsigned length;
+  uint64_t length;
   if (auto CI = dyn_cast<ConstantInt>(mci.getLength()))
     length = CI->getZExtValue();
   else
-    length = std::numeric_limits<unsigned>::max();
+    length = Region::UNBOUNDED;
 
   unsigned r1 = regions->idx(mci.getRawDest(), length);
   unsigned r2 = regions->idx(mci.getRawSource(), length);
 
   const Type *T = regions->get(r1).getType();
-  Decl *P = memcpyProc(T ? type(T) : intType(8), length);
+  // memcpyProc's `unsigned` length keeps its historical 32-bit "unknown"
+  // sentinel; clamp larger (incl. UNBOUNDED) region lengths onto it.
+  unsigned procLen = length >= std::numeric_limits<unsigned>::max()
+                         ? std::numeric_limits<unsigned>::max()
+                         : static_cast<unsigned>(length);
+  Decl *P = memcpyProc(T ? type(T) : intType(8), procLen);
   auxDecls[P->getName()] = P;
 
   const Value *dst = mci.getRawDest(), *src = mci.getRawSource(),
@@ -369,16 +375,19 @@ const Stmt *SmackRep::memcpy(const llvm::MemCpyInst &mci) {
 }
 
 const Stmt *SmackRep::memset(const llvm::MemSetInst &msi) {
-  unsigned length;
+  uint64_t length;
   if (auto CI = dyn_cast<ConstantInt>(msi.getLength()))
     length = CI->getZExtValue();
   else
-    length = std::numeric_limits<unsigned>::max();
+    length = Region::UNBOUNDED;
 
   unsigned r = regions->idx(msi.getRawDest(), length);
 
   const Type *T = regions->get(r).getType();
-  Decl *P = memsetProc(T ? type(T) : intType(8), length);
+  unsigned procLen = length >= std::numeric_limits<unsigned>::max()
+                         ? std::numeric_limits<unsigned>::max()
+                         : static_cast<unsigned>(length);
+  Decl *P = memsetProc(T ? type(T) : intType(8), procLen);
   auxDecls[P->getName()] = P;
 
   const Value *dst = msi.getRawDest(), *val = msi.getValue(),
@@ -390,6 +399,69 @@ const Stmt *SmackRep::memset(const llvm::MemSetInst &msi) {
        integerToPointer(expr(len), len->getType()->getIntegerBitWidth()),
        Expr::lit(msi.isVolatile())},
       {memReg(r)});
+}
+
+// Model a call through a function pointer devirt/SVF could not resolve like a
+// call to a bodyless external declaration: the unknown callee may write any
+// memory region and returns an arbitrary value. SmackModuleGenerator appends
+// `modifies <every memory map>` to these procedures after translation (the
+// region set is only complete then) — the same conservative treatment external
+// declarations receive. This over-approximates the unknown callee; emitting
+// `assume false` here instead would under-approximate (delete real executions
+// at a reachable site) and could falsely verify.
+const Stmt *SmackRep::unknownIndirectCall(const llvm::CallBase &CB) {
+  const llvm::Type *T = CB.getType();
+  std::string name =
+      "$unresolved.indirect." + (T->isVoidTy() ? "void" : type(T));
+  if (!unknownCallProcs.count(name)) {
+    std::list<Binding> rets;
+    if (!T->isVoidTy())
+      rets.push_back({Naming::RET_VAR, type(T)});
+    unknownCallProcs[name] = Decl::procedure(name, {}, rets);
+  }
+  std::list<std::string> callRets;
+  if (!T->isVoidTy())
+    callRets.push_back(naming->get(CB));
+  // The attribute keeps every such site grep-able in the .bpl (it marks the
+  // havoc-modeled unknown-callee calls, distinct from devirt-bounce assumes).
+  return Stmt::call(name, {}, callRets, {Attr::attr("unresolved_indirect")});
+}
+
+std::list<ProcDecl *> SmackRep::unknownIndirectCallProcs() {
+  std::list<ProcDecl *> procs;
+  for (auto &entry : unknownCallProcs)
+    procs.push_back(entry.second);
+  return procs;
+}
+
+bool SmackRep::isConstRegion(unsigned region) {
+  if (!SmackOptions::ConstRegions && !std::getenv("SMACK_CONST_REGIONS"))
+    return false;
+  DSAWrapper *dsa = Region::getDSA();
+  return dsa && dsa->isConstOnly(regions->get(region).getRepresentative());
+}
+
+bool SmackRep::isConstRegion(const llvm::Value *v) {
+  return isConstRegion(regions->idx(v));
+}
+
+bool SmackRep::recordConstRegionStore(const StoreInst &SI) {
+  const unsigned R = regions->idx(SI);
+  if (!isConstRegion(R))
+    return false;
+  const Value *P = SI.getPointerOperand();
+  const Value *V = SI.getValueOperand()->stripPointerCastsAndAliases();
+  // A const-globals-only region is written only by __SMACK_static_init at
+  // constant addresses with constant values. If either operand is not
+  // constant the value could not be a module-level axiom (it would reference a
+  // procedure-local); fall through to a normal store (a store to a `const`
+  // map, which Boogie rejects — surfacing the eligibility bug loudly rather
+  // than silently mis-modeling).
+  if (!isa<Constant>(P) || !isa<Constant>(V))
+    return false;
+  const Type *T = V->getType();
+  constRegionAxiomExprs.push_back(Expr::eq(load(R, P, T), expr(V)));
+  return true;
 }
 
 const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
@@ -419,6 +491,10 @@ const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
         auto T = AI->getAllocatedType();
         const unsigned bits = this->getSize(T);
         const unsigned bytes = bits / 8;
+        // idx(AI) takes the alloca's whole-object window. Under field windows
+        // the scan already fused this annotated component (coverWhole in
+        // Regions::visitCallInst), so the whole-object window is contained in
+        // that single region — no W4 cascade.
         const unsigned R = regions->idx(AI);
         bool bytewise = regions->get(R).bytewiseAccess();
 

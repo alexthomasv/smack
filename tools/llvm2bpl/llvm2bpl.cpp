@@ -186,6 +186,17 @@ void writeMemoryPartitionReport(const smack::SmackMemoryPartitionReport &report,
     J.attribute("memory_access_count", report.memoryAccessCount);
     J.attribute("merge_count", report.mergeCount);
     J.attribute("late_region_count", report.lateRegionCount);
+    J.attribute("svf_universal_region", report.svfUniversalRegion);
+    J.attribute("svf_live_unresolved_access_count",
+                report.svfLiveUnresolvedAccessCount);
+    J.attribute("svf_blackhole_access_count", report.svfBlackholeAccessCount);
+    J.attribute("svf_reachable_function_count",
+                report.svfReachableFunctionCount);
+    J.attribute("svf_noalias_seed_count", report.svfNoAliasSeedCount);
+    J.attribute("svf_field_windows", report.svfFieldWindows);
+    J.attribute("svf_offset_known_count", report.svfOffsetKnownCount);
+    J.attribute("windowed_region_count", report.windowedRegionCount);
+    J.attribute("split_component_count", report.splitComponentCount);
     J.attribute("oracle_access_count", report.oracleAccessCount);
     J.attribute("oracle_callsite_effect_count",
                 report.oracleCallsiteEffectCount);

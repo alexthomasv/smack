@@ -54,6 +54,15 @@ struct SmackMemoryPartitionReport {
   unsigned memoryAccessCount = 0;
   unsigned mergeCount = 0;
   unsigned lateRegionCount = 0;
+  bool svfUniversalRegion = false;
+  unsigned svfLiveUnresolvedAccessCount = 0;
+  unsigned svfBlackholeAccessCount = 0;
+  unsigned svfReachableFunctionCount = 0;
+  unsigned svfNoAliasSeedCount = 0;
+  bool svfFieldWindows = false;
+  unsigned svfOffsetKnownCount = 0;
+  unsigned windowedRegionCount = 0;
+  unsigned splitComponentCount = 0;
   unsigned singletonCount = 0;
   unsigned allocatedCount = 0;
   unsigned bytewiseCount = 0;

@@ -6,8 +6,10 @@
 #include "smack/DSAWrapper.h"
 #include "smack/Debug.h"
 #include "smack/InitializePasses.h"
+#include "smack/Naming.h"
 #include "smack/SmackOptions.h"
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstIterator.h"
@@ -52,17 +54,20 @@ unsigned DSAWrapper::ufFind(unsigned x) {
   return x;
 }
 
-void DSAWrapper::ufUnite(unsigned a, unsigned b) {
+bool DSAWrapper::ufUnite(unsigned a, unsigned b) {
   ufParent.emplace(a, a);
   ufParent.emplace(b, b);
   unsigned ra = ufFind(a), rb = ufFind(b);
-  if (ra != rb)
+  if (ra != rb) {
     ufParent[ra] = rb;
+    return true;
+  }
+  return false;
 }
 
 void DSAWrapper::getAnalysisUsage(llvm::AnalysisUsage &AU) const {
-  // We run SVF directly inside runOnModule; no LLVM analysis dependency.
-  AU.setPreservesAll();
+  // We run SVF directly inside runOnModule; no LLVM analysis dependency. SVF
+  // normalizes the LLVM module in place, so claiming setPreservesAll is false.
 }
 
 // Underlying object of `v`, additionally seeing through a single-store,
@@ -147,11 +152,17 @@ void DSAWrapper::computeReachable(llvm::Module &M) {
   for (llvm::Function &F : M) {
     llvm::StringRef n = F.getName();
     if (!F.isDeclaration() &&
-        (n.contains("wrapper") || n == "main" || n.starts_with("__SMACK") ||
-         n.starts_with("__VERIFIER")) &&
+        (SmackOptions::isEntryPoint(n) || n == Naming::STATIC_INIT_PROC ||
+         n.starts_with(Naming::INIT_FUNC_PREFIX)) &&
         reachableFuncs.insert(&F).second)
       work.push_back(&F);
   }
+  // Direct llvm2bpl users may omit -entry-points. In that case analyze every
+  // defined function: it is conservative and avoids guessing from substrings.
+  if (work.empty())
+    for (llvm::Function &F : M)
+      if (!F.isDeclaration() && reachableFuncs.insert(&F).second)
+        work.push_back(&F);
   while (!work.empty()) {
     llvm::Function *F = work.back();
     work.pop_back();
@@ -187,6 +198,8 @@ void DSAWrapper::buildUnionFind(llvm::Module &M) {
     unsigned first = 0;
     bool have = false;
     for (SVF::NodeID o : pts) {
+      if (o == pag->getConstantNode())
+        continue; // SVF sentinel, not one concrete memory allocation
       ufFind(o); // ensure present
       if (!have) {
         first = o;
@@ -226,12 +239,23 @@ void DSAWrapper::buildUnionFind(llvm::Module &M) {
   // (merge-only) — the pointer-level analogue of the object-level field->base
   // collapse below, catching the pointers SVF did not base on the struct.
   auto uniteAll = [&](const SVF::PointsTo &pa, const SVF::PointsTo &pb) {
-    if (pa.empty() || pb.empty())
-      return;
-    unsigned root = *pa.begin();
-    ufFind(root);
-    for (SVF::NodeID o : pa) { ufFind(o); ufUnite(root, o); }
-    for (SVF::NodeID o : pb) { ufFind(o); ufUnite(root, o); }
+    unsigned root = 0;
+    bool have = false;
+    auto add = [&](const SVF::PointsTo &points) {
+      for (SVF::NodeID o : points) {
+        if (o == pag->getConstantNode())
+          continue;
+        ufFind(o);
+        if (!have) {
+          root = o;
+          have = true;
+        } else {
+          ufUnite(root, o);
+        }
+      }
+    };
+    add(pa);
+    add(pb);
   };
   auto uniteWithBase = [&](const llvm::Value *p) {
     if (!p || !p->getType()->isPointerTy() || !ms->hasValueNode(p))
@@ -311,6 +335,176 @@ void DSAWrapper::buildUnionFind(llvm::Module &M) {
       if (const SVF::BaseObjVar *bo = pag->getBaseObject(o))
         ufUnite(o, bo->getId());
 
+  // Entry parameters marked `noalias` denote mutually disjoint externally
+  // supplied objects. SVF intentionally has no allocation object for these
+  // values, so seed a synthetic component for each contract-bearing argument.
+  // Then propagate pointer equality through direct and completely resolved
+  // indirect calls. This is merge-only: an unannotated argument never creates
+  // a partition, while any discovered equality coalesces components.
+  for (llvm::Function &F : M)
+    if (SmackOptions::isEntryPoint(F.getName()))
+      for (llvm::Argument &A : F.args())
+        if (A.getType()->isPointerTy() && A.hasNoAliasAttr()) {
+          unsigned root = nextSyntheticRoot--;
+          ufFind(root);
+          syntheticObjects.insert(root);
+          explicitRoots[&A] = root;
+          ++noAliasSeedCount;
+        }
+
+  auto knownRoot = [&](const llvm::Value *v) -> unsigned {
+    if (!v || !v->getType()->isPointerTy())
+      return 0;
+    auto explicitIt = explicitRoots.find(v);
+    if (explicitIt != explicitRoots.end())
+      return ufFind(explicitIt->second) + 1;
+    if (ms->hasValueNode(v)) {
+      const SVF::PointsTo &pts = ander->getPts(ms->getValueNode(v));
+      for (SVF::NodeID o : pts)
+        if (o != pag->getConstantNode())
+          return ufFind(o) + 1;
+    }
+    const llvm::Value *base = underlyingThroughSpill(v);
+    explicitIt = explicitRoots.find(base);
+    if (explicitIt != explicitRoots.end())
+      return ufFind(explicitIt->second) + 1;
+    if (base && base != v && ms->hasValueNode(base)) {
+      const SVF::PointsTo &pts = ander->getPts(ms->getValueNode(base));
+      for (SVF::NodeID o : pts)
+        if (o != pag->getConstantNode())
+          return ufFind(o) + 1;
+    }
+    return 0;
+  };
+  // Propagate pointer equality actual==formal across a (direct or completely
+  // SVF-resolved indirect) call edge. When both sides have components, unite
+  // them (merge-only). When exactly one side is known, the unknown side ADOPTS
+  // the known component. Soundness of the adoption arms: the two values are
+  // the same runtime pointer, so adoption is sound iff the adopted component
+  // covers the value's real targets — which holds within the SVF trust
+  // envelope: (a) an empty-points-to value whose base resolves is handled by
+  // knownRoot's base walk (must-alias); (b) a value SVF never saw was created
+  // post-SVF by the devirt rewrite, whose actuals equal pre-rewrite values SVF
+  // did model; (c) genuinely-empty points-to on a value SVF DID see is
+  // Andersen's own claim that the pointer targets nothing it tracks — the same
+  // claim every resolved formal already rests on. The arms transport
+  // components across a proven equality; they do not widen that envelope.
+  auto bindEqual = [&](const llvm::Value *actual,
+                       const llvm::Argument *formal) -> bool {
+    unsigned ar = knownRoot(actual);
+    unsigned fr = knownRoot(formal);
+    bool changed = false;
+    if (ar && fr) {
+      changed = ufUnite(ar - 1, fr - 1);
+    } else if (ar) {
+      explicitRoots[formal] = ar - 1;
+      changed = true;
+    } else if (fr) {
+      explicitRoots[actual] = fr - 1;
+      changed = true;
+    }
+    return changed;
+  };
+  // Iterate to a TRUE fixpoint. Termination: every round only adds
+  // information — ufUnite merges components (at most #objects-1 successful
+  // merges over the whole run) and explicitRoots only gains entries (at most
+  // one per pointer value) — so `changed` must eventually stay false. A
+  // bounded round count would NOT be sound here: knowledge propagates one
+  // call/phi edge per round, and exiting early with `changed` still true can
+  // leave a must-alias pair (actual vs formal, phi vs incoming) in two
+  // never-united components — both resolved, so the catch-all below would not
+  // fire, silently splitting aliasing pointers into distinct regions.
+  while (true) {
+    bool changed = false;
+    for (llvm::Function &F : M)
+      for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
+        // Pointer PHIs/selects introduced by loop normalization denote one of
+        // their incoming pointers.  SVF occasionally leaves these new values
+        // objectless even when every alternative is resolved.  A static SMACK
+        // map must work for every alternative, so merge all known incoming
+        // components and bind the result.  If any non-benign alternative is
+        // still unknown, leave the result unresolved so the sound catch-all
+        // below remains active.
+        auto bindAlternatives = [&](llvm::Value *result,
+                                    llvm::ArrayRef<llvm::Value *> values) {
+          unsigned component = 0;
+          bool unknown = false;
+          for (llvm::Value *value : values) {
+            const llvm::Value *stripped = value->stripPointerCasts();
+            if (isa<ConstantPointerNull>(stripped) || isa<UndefValue>(stripped))
+              continue;
+            unsigned r = knownRoot(value);
+            if (!r) {
+              // Canonical loop-carried pointer induction:
+              //   p = phi [base, preheader], [gep p, latch]
+              // The self-derived backedge cannot introduce a different
+              // allocation; once the non-cyclic incoming edge is known it
+              // supplies the component for the whole recurrence.
+              if (underlyingThroughSpill(value) == result)
+                continue;
+              unknown = true;
+              continue;
+            }
+            if (!component)
+              component = r;
+            else {
+              changed = ufUnite(component - 1, r - 1) || changed;
+            }
+          }
+          if (unknown || !component)
+            return;
+          unsigned rr = knownRoot(result);
+          if (rr) {
+            changed = ufUnite(component - 1, rr - 1) || changed;
+          } else {
+            explicitRoots[result] = ufFind(component - 1);
+            changed = true;
+          }
+        };
+        if (auto *phi = dyn_cast<PHINode>(&*I)) {
+          if (phi->getType()->isPointerTy()) {
+            llvm::SmallVector<llvm::Value *, 4> incoming;
+            for (llvm::Value *value : phi->incoming_values())
+              incoming.push_back(value);
+            bindAlternatives(phi, incoming);
+          }
+        } else if (auto *select = dyn_cast<SelectInst>(&*I)) {
+          if (select->getType()->isPointerTy()) {
+            llvm::Value *alternatives[] = {select->getTrueValue(),
+                                            select->getFalseValue()};
+            bindAlternatives(select, alternatives);
+          }
+        }
+
+        auto *CB = dyn_cast<llvm::CallBase>(&*I);
+        if (!CB || CB->isInlineAsm())
+          continue;
+        auto bindCallee = [&](llvm::Function *callee) {
+          if (!callee || callee->isDeclaration())
+            return;
+          unsigned count = std::min<unsigned>(CB->arg_size(),
+                                              callee->arg_size());
+          for (unsigned i = 0; i < count; ++i)
+            if (CB->getArgOperand(i)->getType()->isPointerTy() &&
+                callee->getArg(i)->getType()->isPointerTy())
+              changed = bindEqual(CB->getArgOperand(i), callee->getArg(i)) ||
+                        changed;
+        };
+        if (llvm::Function *callee = CB->getCalledFunction()) {
+          bindCallee(callee);
+        } else if (CB->getCalledOperand() &&
+                   ms->hasValueNode(CB->getCalledOperand())) {
+          if (SVF::CallICFGNode *node = ms->getCallICFGNode(CB))
+            if (ander->hasIndCSCallees(node))
+              for (const SVF::FunObjVar *fo : ander->getIndCSCallees(node))
+                bindCallee(M.getFunction(fo->getName()));
+        }
+      }
+    if (!changed)
+      break;
+  }
+  valueRootPlus1.clear();
+
   // SOUND CATCH-ALL. A LIVE mem-op pointer that SVF left unresolved (no region)
   // may alias ANY object; the split-memory invariant (may-alias => same region)
   // can then only be kept by putting everything in one region. Scan reachable
@@ -322,35 +516,112 @@ void DSAWrapper::buildUnionFind(llvm::Module &M) {
   // Must check the SAME mem-op pointer set as the SMACK_AUDIT_REGION_SOUNDNESS
   // audit (load/store ptr + memcpy dest AND source), else the audit could flag a
   // live unresolved pointer the trigger missed.
+  auto hasUnknownTarget = [&](const llvm::Value *addr) {
+    if (!addr || !ms->hasValueNode(addr))
+      return false;
+    const SVF::PointsTo &pts = ander->getPts(ms->getValueNode(addr));
+    for (SVF::NodeID o : pts) {
+      // Black-hole means "may point anywhere" and must force the universal
+      // region. SVF's constant node is instead a distinguished constant-data
+      // object (for example blockaddress); it is not an arbitrary-memory top.
+      if (o == pag->getBlackHoleNode())
+        return true;
+      if (pag->hasGNode(o))
+        if (const SVF::BaseObjVar *bo = pag->getBaseObject(o))
+          if (bo->isBlackHoleObj())
+            return true;
+    }
+    return false;
+  };
   auto isLiveUnresolved = [&](const llvm::Value *addr) {
-    if (!addr || rootPlus1(addr) != 0)
+    if (!addr)
       return false;
     const llvm::Value *s = addr->stripPointerCasts();
-    return !(isa<ConstantPointerNull>(s) || isa<UndefValue>(s) ||
-             isRoConstData(addr));
+    if (isa<ConstantPointerNull>(s) || isa<UndefValue>(s) ||
+        isRoConstData(addr))
+      return false;
+    bool blackhole = hasUnknownTarget(addr);
+    bool unresolved = rootPlus1(addr) == 0 || blackhole;
+    if (unresolved) {
+      ++liveUnresolvedAccessCount;
+      if (blackhole)
+        ++blackholeAccessCount;
+    }
+    return unresolved;
   };
   bool liveUnresolved = false;
   for (auto &F : M) {
     if (!reachableFuncs.count(&F))
       continue;
-    for (inst_iterator I = inst_begin(&F), E = inst_end(&F);
-         I != E && !liveUnresolved; ++I) {
+    for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
+      bool unresolvedHere = false;
       if (auto *L = dyn_cast<LoadInst>(&*I))
-        liveUnresolved = isLiveUnresolved(L->getPointerOperand());
+        unresolvedHere = isLiveUnresolved(L->getPointerOperand());
       else if (auto *S = dyn_cast<StoreInst>(&*I))
-        liveUnresolved = isLiveUnresolved(S->getPointerOperand());
+        unresolvedHere = isLiveUnresolved(S->getPointerOperand());
+      else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&*I))
+        unresolvedHere = isLiveUnresolved(CX->getPointerOperand());
+      else if (auto *RMW = dyn_cast<AtomicRMWInst>(&*I))
+        unresolvedHere = isLiveUnresolved(RMW->getPointerOperand());
       else if (auto *MI = dyn_cast<MemIntrinsic>(&*I)) {
-        liveUnresolved = isLiveUnresolved(MI->getRawDest());
-        if (!liveUnresolved)
-          if (auto *MT = dyn_cast<MemTransferInst>(MI))
-            liveUnresolved = isLiveUnresolved(MT->getRawSource());
+        unresolvedHere = isLiveUnresolved(MI->getRawDest());
+        if (auto *MT = dyn_cast<MemTransferInst>(MI))
+          unresolvedHere = isLiveUnresolved(MT->getRawSource()) ||
+                           unresolvedHere;
+      } else if (auto *CB = dyn_cast<CallBase>(&*I)) {
+        const llvm::Function *callee = CB->getCalledFunction();
+        if (callee && callee->getName().contains("__SMACK_values") &&
+            CB->arg_size() > 0)
+          unresolvedHere = isLiveUnresolved(CB->getArgOperand(0));
       }
+      if (unresolvedHere && std::getenv("SMACK_AUDIT_C2_DETAIL")) {
+        const llvm::Value *addr = nullptr;
+        if (auto *L = dyn_cast<LoadInst>(&*I))
+          addr = L->getPointerOperand();
+        else if (auto *S = dyn_cast<StoreInst>(&*I))
+          addr = S->getPointerOperand();
+        else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&*I))
+          addr = CX->getPointerOperand();
+        else if (auto *RMW = dyn_cast<AtomicRMWInst>(&*I))
+          addr = RMW->getPointerOperand();
+        const llvm::Value *base = addr ? underlyingThroughSpill(addr) : nullptr;
+        auto ptsCount = [&](const llvm::Value *v) -> unsigned {
+          return v && ms->hasValueNode(v)
+                   ? ander->getPts(ms->getValueNode(v)).count()
+                   : 0;
+        };
+        llvm::errs() << "[svf-region] live unresolved in " << F.getName()
+                     << ": " << *I << "\n[svf-region]   addr=";
+        if (addr)
+          llvm::errs() << *addr;
+        else
+          llvm::errs() << "<multi-address intrinsic>";
+        llvm::errs() << " hasNode=" << (addr && ms->hasValueNode(addr))
+                     << " pts=" << ptsCount(addr) << " base=";
+        if (base)
+          llvm::errs() << *base;
+        else
+          llvm::errs() << "<none>";
+        llvm::errs() << " baseHasNode=" << (base && ms->hasValueNode(base))
+                     << " basePts=" << ptsCount(base) << "\n";
+        if (auto *phi = dyn_cast_or_null<PHINode>(base))
+          for (llvm::Value *incoming : phi->incoming_values()) {
+            const llvm::Value *incomingBase = underlyingThroughSpill(incoming);
+            llvm::errs() << "[svf-region]   phi-incoming=" << *incoming
+                         << " root=" << rootPlus1(incoming) << " base=";
+            if (incomingBase)
+              llvm::errs() << *incomingBase;
+            else
+              llvm::errs() << "<none>";
+            llvm::errs() << " baseRoot=" << rootPlus1(incomingBase) << "\n";
+          }
+      }
+      liveUnresolved = liveUnresolved || unresolvedHere;
     }
-    if (liveUnresolved)
-      break;
   }
-  if (liveUnresolved && !ufParent.empty()) {
-    unsigned root = ufParent.begin()->first;
+  if (liveUnresolved) {
+    unsigned root = ufParent.empty() ? pag->getBlackHoleNode()
+                                     : ufParent.begin()->first;
     ufFind(root);
     for (auto &kv : ufParent)
       ufUnite(root, kv.first);
@@ -479,6 +750,282 @@ void DSAWrapper::buildUnionFind(llvm::Module &M) {
   }
 }
 
+// Single-store spill slot whose unique store provably dominates every load:
+// the -O0 `%slot = alloca ptr; store %p, %slot; ... load %slot` motif. Shares
+// the pattern proof with underlyingThroughSpill (one pointer store INTO the
+// slot, address never escapes, only direct loads + dbg/lifetime uses) and adds
+// a DOMINANCE guard — the store sits in the entry block and precedes
+// same-block loads — upgrading the claim from merge-only strength to the
+// must-equality strength the offset engine needs (a load that could execute
+// before the store would read an uninitialized slot, and Known(δ) on it would
+// be a fabricated offset, not just a coarse one).
+static const llvm::StoreInst *spillSlotUniqueStore(const llvm::LoadInst *load) {
+  if (load->isVolatile())
+    return nullptr;
+  auto *slot = llvm::dyn_cast<llvm::AllocaInst>(load->getPointerOperand());
+  if (!slot)
+    return nullptr;
+  const llvm::StoreInst *theStore = nullptr;
+  for (const llvm::User *u : slot->users()) {
+    if (auto *st = llvm::dyn_cast<llvm::StoreInst>(u)) {
+      if (st->getPointerOperand() != slot || st->isVolatile() ||
+          !st->getValueOperand()->getType()->isPointerTy())
+        return nullptr;
+      if (theStore)
+        return nullptr; // >1 store => not a single-valued spill slot
+      theStore = st;
+    } else if (auto *ld = llvm::dyn_cast<llvm::LoadInst>(u)) {
+      if (ld->getPointerOperand() != slot)
+        return nullptr;
+    } else if (auto *ii = llvm::dyn_cast<llvm::IntrinsicInst>(u)) {
+      switch (ii->getIntrinsicID()) {
+      case llvm::Intrinsic::dbg_declare:
+      case llvm::Intrinsic::dbg_value:
+      case llvm::Intrinsic::lifetime_start:
+      case llvm::Intrinsic::lifetime_end:
+        break;
+      default:
+        return nullptr;
+      }
+    } else {
+      return nullptr; // slot address escapes
+    }
+  }
+  if (!theStore)
+    return nullptr;
+  const llvm::Function *F = theStore->getFunction();
+  if (theStore->getParent() != &F->getEntryBlock())
+    return nullptr;
+  if (load->getParent() == theStore->getParent() &&
+      !theStore->comesBefore(load))
+    return nullptr;
+  return theStore;
+}
+
+// Field-window offset engine (-svf-field-windows). Proves, per pointer value,
+// a CONSTANT byte offset δ from the base of the allocation it points into: in
+// every UB-free execution, address(v) = base(allocation(v)) + δ. Region turns
+// these into (component, [δ, δ+len)) windows that split a may-alias component
+// into disjoint field sub-regions; any value WITHOUT a proven offset keeps the
+// whole-component window [0, ∞) — so arrays (variable indices) stay whole and
+// constant struct fields split.
+//
+// Optimistic descending fixpoint over the lattice ⊤ (no info yet) → Known(δ)
+// → ⊥ (no constant offset). Transfers are monotone (states only descend), so
+// each value changes at most twice and the sweep terminates. ⊤-ignoring meets
+// are the standard SCCP optimism: a value still ⊤ at fixpoint has no grounded
+// derivation (only unreachable-code phi cycles) and reads as "unproven".
+void DSAWrapper::computeValueOffsets(llvm::Module &M) {
+  enum class OS { Top, Known, Bottom };
+  auto state = [&](const llvm::Value *v, int64_t &delta) -> OS {
+    if (offsetBottom.count(v))
+      return OS::Bottom;
+    auto it = knownOffset.find(v);
+    if (it != knownOffset.end()) {
+      delta = it->second;
+      return OS::Known;
+    }
+    return OS::Top;
+  };
+
+  // Universe: every pointer-typed value the transfer rules can see, including
+  // constant-expression operand chains.
+  std::vector<const llvm::Value *> universe;
+  std::unordered_set<const llvm::Value *> inUniverse;
+  std::function<void(const llvm::Value *)> add = [&](const llvm::Value *v) {
+    if (!v || !v->getType()->isPointerTy() || !inUniverse.insert(v).second)
+      return;
+    universe.push_back(v);
+    if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(v))
+      for (const llvm::Use &u : ce->operands())
+        add(u.get());
+  };
+  for (llvm::GlobalVariable &G : M.globals())
+    add(&G);
+  for (llvm::Function &F : M) {
+    for (llvm::Argument &A : F.args())
+      add(&A);
+    for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
+      if (I->getType()->isPointerTy())
+        add(&*I);
+      for (llvm::Use &U : I->operands())
+        add(U.get());
+    }
+  }
+
+  const llvm::DataLayout &DL = M.getDataLayout();
+
+  // Meet over a set of alternative values (phi incomings, select arms, call
+  // actuals): ⊥ absorbs; disagreeing Knowns => ⊥; null/undef alternatives are
+  // skipped (dereferencing them is UB); ⊤ alternatives don't block (optimism).
+  auto meetOver = [&](llvm::ArrayRef<const llvm::Value *> values,
+                      int64_t &out) -> OS {
+    bool have = false;
+    int64_t acc = 0;
+    for (const llvm::Value *iv : values) {
+      const llvm::Value *s = iv->stripPointerCasts();
+      if (llvm::isa<llvm::ConstantPointerNull>(s) ||
+          llvm::isa<llvm::UndefValue>(s))
+        continue;
+      int64_t d;
+      OS st = state(iv, d);
+      if (st == OS::Bottom)
+        return OS::Bottom;
+      if (st == OS::Top)
+        continue;
+      if (!have) {
+        have = true;
+        acc = d;
+      } else if (acc != d)
+        return OS::Bottom;
+    }
+    if (!have)
+      return OS::Top;
+    out = acc;
+    return OS::Known;
+  };
+
+  auto evaluate = [&](const llvm::Value *v, int64_t &out) -> OS {
+    if (llvm::isa<llvm::AllocaInst>(v)) {
+      out = 0;
+      return OS::Known;
+    }
+    if (auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(v)) {
+      if (gv->getType()->getAddressSpace() != 0)
+        return OS::Bottom;
+      out = 0;
+      return OS::Known;
+    }
+    if (auto *gep = llvm::dyn_cast<llvm::GEPOperator>(v)) {
+      // Inbounds-only: an in-bounds GEP stays inside its base allocation, so
+      // the accumulated constant is a base-relative byte offset. Non-inbounds
+      // or variable-index GEPs prove nothing (⊥ ⇒ whole-component window).
+      if (gep->getType()->isVectorTy() || !gep->isInBounds())
+        return OS::Bottom;
+      llvm::APInt off(DL.getIndexSizeInBits(gep->getPointerAddressSpace()), 0);
+      if (!gep->accumulateConstantOffset(DL, off))
+        return OS::Bottom;
+      int64_t base;
+      OS bs = state(gep->getPointerOperand(), base);
+      if (bs != OS::Known)
+        return bs;
+      out = base + off.getSExtValue();
+      return OS::Known;
+    }
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(v)) {
+      if (const llvm::StoreInst *st = spillSlotUniqueStore(load)) {
+        int64_t d;
+        OS s = state(st->getValueOperand(), d);
+        if (s == OS::Known)
+          out = d;
+        return s;
+      }
+      return OS::Bottom;
+    }
+    if (auto *phi = llvm::dyn_cast<llvm::PHINode>(v)) {
+      llvm::SmallVector<const llvm::Value *, 8> vals;
+      for (const llvm::Value *iv : phi->incoming_values())
+        vals.push_back(iv);
+      // NOTE deliberately NO self-loop exception here (unlike
+      // bindAlternatives): `p = phi [base], [gep p, +c]` must meet Known(0)
+      // against Known(c) and fall to ⊥ — a loop-advanced pointer has no single
+      // constant offset. That is exactly what keeps arrays one region.
+      return meetOver(vals, out);
+    }
+    if (auto *sel = llvm::dyn_cast<llvm::SelectInst>(v)) {
+      const llvm::Value *vals[] = {sel->getTrueValue(), sel->getFalseValue()};
+      return meetOver(vals, out);
+    }
+    if (auto *arg = llvm::dyn_cast<llvm::Argument>(v)) {
+      // Interprocedural step, Phase 1: internal, not address-taken, non-byval,
+      // non-entry functions only — the direct callsites below are then the
+      // COMPLETE caller set, so the meet re-grounds the formal to allocation
+      // bases inductively. (Entry-point formals have no callers: external
+      // buffers keep whole-component windows.)
+      const llvm::Function *F = arg->getParent();
+      if (!F->hasLocalLinkage() || F->hasAddressTaken() ||
+          arg->hasByValAttr() || SmackOptions::isEntryPoint(F->getName()))
+        return OS::Bottom;
+      bool have = false, any = false;
+      int64_t acc = 0;
+      unsigned idx = arg->getArgNo();
+      for (const llvm::User *u : F->users()) {
+        auto *cb = llvm::dyn_cast<llvm::CallBase>(u);
+        if (!cb || cb->getCalledFunction() != F)
+          return OS::Bottom; // defensive: unexpected non-callee use
+        if (idx >= cb->arg_size())
+          return OS::Bottom;
+        any = true;
+        int64_t d;
+        OS s = state(cb->getArgOperand(idx), d);
+        if (s == OS::Bottom)
+          return OS::Bottom;
+        if (s == OS::Top)
+          continue;
+        if (!have) {
+          have = true;
+          acc = d;
+        } else if (acc != d)
+          return OS::Bottom;
+      }
+      if (!any)
+        return OS::Bottom; // no callers: dead internal function
+      if (!have)
+        return OS::Top;
+      out = acc;
+      return OS::Known;
+    }
+    if (auto *op = llvm::dyn_cast<llvm::Operator>(v))
+      if (op->getOpcode() == llvm::Instruction::BitCast) {
+        int64_t d;
+        OS s = state(op->getOperand(0), d);
+        if (s == OS::Known)
+          out = d;
+        return s;
+      }
+    return OS::Bottom; // call results, inttoptr, addrspacecast, extern decls…
+  };
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const llvm::Value *v : universe) {
+      int64_t cur;
+      OS curS = state(v, cur);
+      if (curS == OS::Bottom)
+        continue;
+      int64_t next = 0;
+      OS nextS = evaluate(v, next);
+      if (nextS == OS::Bottom) {
+        knownOffset.erase(v);
+        offsetBottom.insert(v);
+        changed = true;
+      } else if (nextS == OS::Known) {
+        if (curS == OS::Top) {
+          knownOffset[v] = next;
+          changed = true;
+        } else if (cur != next) {
+          knownOffset.erase(v);
+          offsetBottom.insert(v);
+          changed = true;
+        }
+      }
+    }
+  }
+
+  // Windows are unsigned byte ranges: negative offsets (pointer arithmetic
+  // below the base is UB, but stay conservative) and absurd magnitudes fall
+  // to "unproven".
+  for (auto it = knownOffset.begin(); it != knownOffset.end();) {
+    if (it->second < 0 || it->second > (int64_t(1) << 32)) {
+      offsetBottom.insert(it->first);
+      it = knownOffset.erase(it);
+    } else
+      ++it;
+  }
+  offsetKnownCount = knownOffset.size();
+}
+
 void DSAWrapper::aggregateRegions() {
   // Collect a stable list of object ids first (ufFind mutates ufParent).
   std::vector<unsigned> objs;
@@ -489,13 +1036,25 @@ void DSAWrapper::aggregateRegions() {
   for (unsigned obj : objs) {
     unsigned root = ufFind(obj);
     RegionInfo &ri = regionInfo[root];
+    ri.sawObject = true;
     const SVF::BaseObjVar *bo = nullptr;
+    if (syntheticObjects.count(obj)) {
+      // A noalias entry parameter represents an externally allocated abstract
+      // object.  It is intentionally absent from SVF's object graph, but that
+      // absence is not an incomplete/unknown points-to result: the LLVM
+      // contract is the evidence that lets this component stay disjoint.
+      ri.allocated = true;
+      ri.arrayLike = true;
+      ri.constOnly = false; // externally supplied buffer, not constant data
+      continue;
+    }
     // getBaseObject is valid for object nodes (FI and Gep); guard defensively.
     if (pag->hasGNode(obj))
       bo = pag->getBaseObject(obj);
     if (!bo) {
       ri.complicated = true;
       ri.incomplete = true;
+      ri.constOnly = false;
       continue;
     }
     if (bo->isHeap() || bo->isStack())
@@ -506,13 +1065,18 @@ void DSAWrapper::aggregateRegions() {
     }
     if (bo->isArray())
       ri.arrayLike = true;
+    bool objConstGlobal = false;
     if (bo->isGlobalObj()) {
       ri.numGlobals++;
       if (ms->hasLLVMValue(bo))
-        if (auto *GV = dyn_cast<GlobalVariable>(ms->getLLVMValue(bo)))
+        if (auto *GV = dyn_cast<GlobalVariable>(ms->getLLVMValue(bo))) {
           if (GV->hasInitializer())
             ri.staticInitd = true;
+          objConstGlobal = GV->isConstant() && GV->hasInitializer();
+        }
     }
+    if (!objConstGlobal)
+      ri.constOnly = false;
     if (memOpdObjs.count(obj))
       ri.memOpd = true;
   }
@@ -529,6 +1093,24 @@ bool DSAWrapper::cachedSVF(SVF::LLVMModuleSet *&ms, SVF::SVFIR *&pag,
 bool DSAWrapper::runOnModule(llvm::Module &M) {
   module = &M;
   dataLayout = &M.getDataLayout();
+  ufParent.clear();
+  regionInfo.clear();
+  memOpdObjs.clear();
+  syntheticObjects.clear();
+  explicitRoots.clear();
+  valueRootPlus1.clear();
+  reachableFuncs.clear();
+  collapsed = false;
+  collapsedRoot = 0;
+  nextSyntheticRoot = std::numeric_limits<unsigned>::max() - 1;
+  noAliasSeedCount = 0;
+  liveUnresolvedAccessCount = 0;
+  blackholeAccessCount = 0;
+  fieldWindowsEnabled =
+      SmackOptions::SvfFieldWindows || std::getenv("SMACK_SVF_WINDOWS");
+  knownOffset.clear();
+  offsetBottom.clear();
+  offsetKnownCount = 0;
 
   // Build SVF once (see g_svf* declarations above). Caveat: the legacy PM
   // re-runs DSAWrapper for the translation consumer after intervening transforms,
@@ -555,6 +1137,10 @@ bool DSAWrapper::runOnModule(llvm::Module &M) {
 
   buildUnionFind(M);
   aggregateRegions();
+  // Offset proofs are only consulted when windows are active; when the
+  // universal catch-all engaged there is one region regardless, so skip.
+  if (fieldWindowsEnabled && !collapsed)
+    computeValueOffsets(M);
 
   // Soundness audit (opt-in): every load/store/mem-intrinsic pointer that gets
   // NO region (empty SVF points-to) is isolated from all real buffers — sound
@@ -762,10 +1348,21 @@ bool DSAWrapper::runOnModule(llvm::Module &M) {
       const SVF::PointsTo &pts = ander->getPts(ms->getValueNode(p));
       if (pts.empty())
         return;
-      unsigned c0 = ufFind(*pts.begin());
-      bool multi = false;
+      // Mirror the derivation: the ConstantNode (SVF's merged constant-data
+      // object) is deliberately outside the union-find (unionPts/rootPlus1
+      // skip it), so ufFind on it would mint a fresh singleton component and
+      // flag a spurious C1 for every {constant, X} points-to set. Constant
+      // data is read-only (writes are UB); reads through whichever region are
+      // over-approximated as unconstrained values — sound by design.
+      unsigned c0 = 0;
+      bool haveC0 = false, multi = false;
       for (SVF::NodeID o : pts) {
-        if (ufFind(o) != c0)
+        if (o == pag->getConstantNode())
+          continue;
+        if (!haveC0) {
+          c0 = ufFind(o);
+          haveC0 = true;
+        } else if (ufFind(o) != c0)
           multi = true; // C1
         auto it = objRegion.find(o);
         if (it == objRegion.end())
@@ -806,9 +1403,7 @@ bool DSAWrapper::runOnModule(llvm::Module &M) {
                      << kv.second << "\n";
   }
 
-  return false; // NOTE: SVF did mutate M, but we report "unchanged" to the PM;
-                // downstream SMACK passes consume the (semantically-equivalent)
-                // mutated module.
+  return true; // SVF normalizes the LLVM module in place.
 }
 
 DSAWrapper::~DSAWrapper() {
@@ -822,10 +1417,16 @@ unsigned DSAWrapper::rootPlus1(const llvm::Value *v) {
   if (it != valueRootPlus1.end())
     return it->second;
   unsigned result = 0;
-  if (v && ms && ms->hasValueNode(v)) {
+  auto explicitIt = explicitRoots.find(v);
+  if (explicitIt != explicitRoots.end())
+    result = ufFind(explicitIt->second) + 1;
+  if (result == 0 && v && ms && ms->hasValueNode(v)) {
     const SVF::PointsTo &pts = ander->getPts(ms->getValueNode(v));
-    if (pts.count() > 0)
-      result = ufFind(*pts.begin()) + 1;
+    for (SVF::NodeID o : pts)
+      if (o != pag->getConstantNode()) {
+        result = ufFind(o) + 1;
+        break;
+      }
   }
   // (R1) Base-object region fallback. A GEP/field pointer that SVF gave no
   // value-node OR an empty points-to (e.g. the GEP'd vtable-field stores SMACK
@@ -839,22 +1440,32 @@ unsigned DSAWrapper::rootPlus1(const llvm::Value *v) {
   // won't conflate unrelated pointers.
   if (result == 0 && v && ms) {
     const llvm::Value *base = underlyingThroughSpill(v);
+    auto baseExplicit = explicitRoots.find(base);
+    if (baseExplicit != explicitRoots.end())
+      result = ufFind(baseExplicit->second) + 1;
     if (base && base != v && ms->hasValueNode(base) &&
         (llvm::isa<llvm::GlobalVariable>(base) ||
          llvm::isa<llvm::Argument>(base) || llvm::isa<llvm::AllocaInst>(base))) {
       const SVF::PointsTo &bpts = ander->getPts(ms->getValueNode(base));
-      if (bpts.count() > 0)
-        result = ufFind(*bpts.begin()) + 1;
+      if (result == 0)
+        for (SVF::NodeID o : bpts)
+          if (o != pag->getConstantNode()) {
+            result = ufFind(o) + 1;
+            break;
+          }
     }
   }
   // SOUND catch-all: once collapsed, a still-unresolved (non-benign) pointer
   // maps to the single universal region — it may alias anything, and everything
-  // resolved was already united into that region. (Resolved pointers reach here
-  // with result != 0 already == collapsedRoot+1, since unite-all merged their
-  // objects; only genuinely unresolved ones need this override.)
+  // resolved was already united into that region. Read-only constant data joins
+  // it too: keeping constants in a second fallback map is sound but defeats the
+  // meaning of a universal partition and duplicates every memory assertion.
+  // (Resolved pointers reach here with result != 0 already == collapsedRoot+1,
+  // since unite-all merged their objects; only objectless values need this
+  // override.)
   if (collapsed && result == 0 && v) {
     const llvm::Value *s = v->stripPointerCasts();
-    if (!isa<ConstantPointerNull>(s) && !isa<UndefValue>(s) && !isRoConstData(v))
+    if (!isa<ConstantPointerNull>(s) && !isa<UndefValue>(s))
       result = collapsedRoot + 1;
   }
   valueRootPlus1[v] = result;
@@ -874,9 +1485,16 @@ MemNodeRef DSAWrapper::getNode(const llvm::Value *v) {
   return r ? encode(r) : nullptr;
 }
 
-unsigned DSAWrapper::getOffset(const llvm::Value *) {
-  // Field-insensitive partition (spike): each region is one collapsed component.
-  return 0;
+uint64_t DSAWrapper::getOffset(const llvm::Value *v) {
+  // Proven constant base-relative byte offset, or 0 when unproven — callers
+  // MUST pair this with hasKnownOffset and widen unproven windows to the whole
+  // component. (Maps are empty unless -svf-field-windows is active.)
+  auto it = knownOffset.find(v);
+  return it != knownOffset.end() ? static_cast<uint64_t>(it->second) : 0;
+}
+
+bool DSAWrapper::hasKnownOffset(const llvm::Value *v) {
+  return knownOffset.count(v) != 0;
 }
 
 unsigned DSAWrapper::getPointedTypeSize(const llvm::Value *v) {
@@ -901,6 +1519,15 @@ bool DSAWrapper::isRead(const llvm::Value *) {
 bool DSAWrapper::isTypeSafe(const llvm::Value *) {
   // Conservative (spike): never treat a region as type-safe, which disables the
   // singleton optimization. Sound; loses some precision/perf to be revisited.
+  //
+  // WARNING before making this precise: isTypeSafe==false is what keeps three
+  // dormant translation paths dead — Region::isSingleton (scalar-collapse of a
+  // whole region into one Boogie variable), per-region `bytewise` divergence
+  // in Region::init, and VectorOperations' unconditional map treatment of
+  // memType(R). Returning true re-arms all three, and each is SILENTLY UNSOUND
+  // if the underlying properties (getNumGlobals / isArray / isMemOpd /
+  // isAllocated, byte-access inference) are not exactly right. Review those
+  // consumers before changing this.
   return false;
 }
 
@@ -932,9 +1559,21 @@ bool DSAWrapper::isArray(MemNodeRef n) {
   auto *i = infoOf(n);
   return i && i->arrayLike;
 }
+bool DSAWrapper::isConstOnly(MemNodeRef n) {
+  if (collapsed)
+    return false; // universal region mixes everything
+  auto *i = infoOf(n);
+  return i && i->sawObject && i->constOnly && i->numGlobals > 0;
+}
 bool DSAWrapper::isCollapsed(MemNodeRef) {
-  // Field-insensitive partition (spike).
-  return true;
+  // isCollapsed==true makes Region::overlaps ignore offset/length for
+  // same-representative regions, so a component is always ONE region. With
+  // -svf-field-windows the offset engine (computeValueOffsets) provides the
+  // field-sensitive derivation that makes window-based splitting sound:
+  // proven constant base-relative offsets, whole-component windows for
+  // everything unproven. The universal catch-all always collapses windows
+  // too (one region, full stop).
+  return !fieldWindowsEnabled || collapsed;
 }
 
 } // namespace smack

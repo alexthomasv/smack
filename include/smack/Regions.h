@@ -27,14 +27,21 @@ class DSAWrapper;
 struct SmackMemoryPartitionReport;
 
 class Region {
+public:
+  // Sentinel for "window extends to the end of the component" (unknown or
+  // unbounded length). Windows are byte intervals [offset, offset+length)
+  // with SATURATING ends — arithmetic must never wrap (a wrapped end would
+  // under-merge, silently splitting aliasing accesses).
+  static constexpr uint64_t UNBOUNDED = ~0ULL;
+
 private:
   LLVMContext *context;
   const Value *pointer;
   Function *function;
   MemNodeRef representative;
   const Type *type;
-  unsigned offset;
-  unsigned length;
+  uint64_t offset;
+  uint64_t length;
 
   bool singleton;
   bool allocated;
@@ -52,18 +59,18 @@ public:
 private:
   static DSAWrapper *DSA;
 
-  static bool isSingleton(const llvm::Value *v, unsigned length);
+  static bool isSingleton(const llvm::Value *v, uint64_t length);
   static bool isAllocated(MemNodeRef N);
   static bool isComplicated(MemNodeRef N);
 
-  void init(const Value *V, const Type *accessType, unsigned length);
-  bool isDisjoint(unsigned offset, unsigned length);
+  void init(const Value *V, const Type *accessType, uint64_t length);
+  bool isDisjoint(uint64_t offset, uint64_t length);
 
 public:
   Region(const Value *V);
-  Region(const Value *V, unsigned length);
+  Region(const Value *V, uint64_t length);
   Region(const Value *V, const Type *accessType);
-  Region(const Value *V, const Type *accessType, unsigned length);
+  Region(const Value *V, const Type *accessType, uint64_t length);
   Region(const llvm::LoadInst &I);
   Region(const llvm::StoreInst &I);
 
@@ -82,6 +89,8 @@ public:
   bool isComplicated() const { return complicated; }
   bool isCollapsed() const { return collapsed; }
   bool hasRepresentative() const { return representative != nullptr; }
+  MemNodeRef getRepresentative() const { return representative; }
+  bool isWindowed() const { return length != UNBOUNDED; }
   const Type *getType() const { return type; }
 
   void print(raw_ostream &);
@@ -90,6 +99,10 @@ public:
 class Regions : public ModulePass, public InstVisitor<Regions> {
 private:
   std::vector<Region> regions;
+  unsigned memoryAccessCount = 0;
+  unsigned mergeCount = 0;
+  unsigned lateRegionCount = 0;
+  bool initialScanComplete = false;
   unsigned idx(Region &R);
 
 public:
@@ -100,10 +113,10 @@ public:
 
   unsigned size() const;
   unsigned idx(const llvm::Value *v);
-  unsigned idx(const llvm::Value *v, unsigned length);
+  unsigned idx(const llvm::Value *v, uint64_t length);
   unsigned idx(const llvm::Value *v, const llvm::Type *accessType);
   unsigned idx(const llvm::Value *v, const llvm::Type *accessType,
-               unsigned length);
+               uint64_t length);
   unsigned idx(const llvm::LoadInst &I);
   unsigned idx(const llvm::StoreInst &I);
   Region &get(unsigned R);

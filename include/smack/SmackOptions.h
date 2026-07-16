@@ -32,6 +32,13 @@ public:
   // Skip the SVF-based devirtualization pass (Devirtualize). Off by default, so
   // indirect calls SVF resolves completely get rewritten to direct dispatch.
   static const llvm::cl::opt<bool> SkipDevirt;
+  // Field-granular memory regions (also enabled by env SMACK_SVF_WINDOWS).
+  static const llvm::cl::opt<bool> SvfFieldWindows;
+  // Model constant-global-only regions as Boogie `const` maps fixed by axioms
+  // instead of `var` maps written by __SMACK_static_init stores. VERIFIER-ONLY:
+  // the concrete interpreter cannot yet consume select-axioms, so leave OFF for
+  // any flow that runs the interpreter (traces / byte-match).
+  static const llvm::cl::opt<bool> ConstRegions;
   static const llvm::cl::opt<bool> NoByteAccessInference;
   static const llvm::cl::opt<bool> FloatEnabled;
   static const llvm::cl::opt<bool> MemorySafety;

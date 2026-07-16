@@ -80,6 +80,15 @@ PreservedAnalyses MergeArrayGEPNewPM::run(Module &M, ModuleAnalysisManager &) {
 static void simplifyGEP(GetElementPtrInst *GEP) {
   Value *PtrOp = GEP->getOperand(0);
   if (GEPOperator *Src = dyn_cast<GEPOperator>(PtrOp)) {
+    if (Src->getNumOperands() < 2)
+      return; // degenerate GEP with no indices
+    // Under opaque pointers a GEP chain may switch element types mid-chain
+    // (e.g. an i8 byte-offset GEP off a struct-typed GEP). Merging such a
+    // chain re-scales the junction index by the WRONG element size — a silent
+    // miscompilation. Only merge type-coherent chains (the same guard
+    // InstCombine's visitGEPOfGEP applies).
+    if (Src->getResultElementType() != GEP->getSourceElementType())
+      return;
     // Note that if our source is a gep chain itself that we wait for that
     // chain to be resolved before we perform this transformation.  This
     // avoids us creating a TON of code in some cases.
@@ -92,9 +101,17 @@ static void simplifyGEP(GetElementPtrInst *GEP) {
     SmallVector<Value*, 8> Indices;
 
     // Find out whether the last index in the source GEP is a sequential idx.
-    bool EndsWithSequential = false;
+    // NOTE the first GEP index steps over the POINTER (always sequential,
+    // does not descend into the source element type); only the remaining
+    // indices navigate inside it. Feeding the first index through the
+    // element-type walk (an off-by-one this loop used to have) misclassifies
+    // a src ending on a STRUCT FIELD as sequential; the Sum below then adopts
+    // the outer GEP's i64 index type for a struct-field position, which is
+    // invalid IR (struct indices must be i32) — the LLVM verifier rejects it
+    // and SVF's gep-type walk crashes on it.
+    bool EndsWithSequential = true;
     Type *IndexedTy = Src->getSourceElementType();
-    for (auto I = Src->idx_begin(), E = Src->idx_end(); I != E; ++I) {
+    for (auto I = Src->idx_begin() + 1, E = Src->idx_end(); I != E; ++I) {
       if (!IndexedTy)
         return;
 

@@ -1118,9 +1118,16 @@ void MemDeclGen::generateMemoryMaps(std::stringstream &s) const {
                " regions)",
            s);
 
-  for (auto M : prelude.rep.memoryMaps())
-    s << "var " << M.first << ": " << M.second << ";"
+  // Constant-global-only regions (-smack-const-regions) are declared `const`
+  // and fixed by axioms (see generateConstRegionAxioms); everything else is a
+  // mutable `var` map. memoryMaps() is index-aligned with the region table.
+  unsigned region = 0;
+  for (auto M : prelude.rep.memoryMaps()) {
+    bool isConst = prelude.rep.isConstRegion(region);
+    s << (isConst ? "const " : "var ") << M.first << ": " << M.second << ";"
       << "\n";
+    ++region;
+  }
 
   s << "\n";
 }

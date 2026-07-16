@@ -44,7 +44,10 @@ public:
     unsigned getPointedTypeSize(const llvm::Value *v) {
       return wrapper->getPointedTypeSize(v);
     }
-    unsigned getOffset(const llvm::Value *v) { return wrapper->getOffset(v); }
+    uint64_t getOffset(const llvm::Value *v) { return wrapper->getOffset(v); }
+    bool hasKnownOffset(const llvm::Value *v) {
+      return wrapper->hasKnownOffset(v);
+    }
     MemNodeRef getNode(const llvm::Value *v) { return wrapper->getNode(v); }
     bool isTypeSafe(const llvm::Value *v) { return wrapper->isTypeSafe(v); }
     unsigned getNumGlobals(MemNodeRef n) { return wrapper->getNumGlobals(n); }

@@ -1507,6 +1507,11 @@ void SmackInstGenerator::visitStoreInst(llvm::StoreInst &si) {
     auto M = Expr::id(rep->memPath(R));
     auto E = Expr::fn(D->getName(), {M, rep->expr(P), rep->expr(V)});
     emit(Stmt::assign(M, E), storeAttrs);
+  } else if (rep->recordConstRegionStore(si)) {
+    // -smack-const-regions: this static-init store into a constant-global
+    // region became a module-level axiom (load(M,addr)==val); the `const` map
+    // needs no store statement. Emit a marker comment for traceability.
+    emit(Stmt::comment("const-region store elided (see axiom)"), storeAttrs);
   } else {
     emit(rep->store(si), storeAttrs);
     if (const Stmt *inverseAssume = rep->inverseFPCastAssume(&si)) {
@@ -1651,18 +1656,17 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     } else {
       // SVF devirt could not resolve this indirect call to a concrete Function
       // (incomplete/black-hole points-to, so the devirt left it untouched).
-      // Block the path with `assume false` instead of crashing on cast<>. This
-      // is sound iff the site is unreachable; if it is reachable the interpreter
-      // stalls here (observable), pinpointing the devirt gap. Warn so every such
-      // site is listed in the build log.
+      // Model the unknown callee like a bodyless external declaration: the
+      // call havocs every memory region and returns an arbitrary value (see
+      // SmackRep::unknownIndirectCall). This over-approximation stays sound
+      // when the site is reachable — `assume false` here would instead delete
+      // real executions and could falsely verify everything past the call.
+      // Warn so every such site is listed in the build log.
       SmackWarnings::warnApproximate(
           "unresolved indirect call in " + ci.getFunction()->getName().str() +
               ": " + i2s(ci),
           currBlock, &ci);
-      // Tag the dead-path assume so it is grep-able in the .bpl (distinguishes
-      // these unresolved-call fallbacks from devirt-bounce/`unreachable` assumes).
-      emit(Stmt::assume(Expr::lit(false)),
-           {Attr::attr("unresolved_indirect")});
+      emit(rep->unknownIndirectCall(ci));
       return;
     }
   }

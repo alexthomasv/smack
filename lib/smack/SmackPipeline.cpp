@@ -18,6 +18,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassInstrumentation.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/LinkAllPasses.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -253,11 +254,6 @@ void addSmackPreBplPasses(Module &module, legacy::PassManager &passManager,
   if (!options.modular)
     passManager.add(makePass<RemoveDeadDefs>());
   passManager.add(makePass<MergeArrayGEP>());
-  // Devirtualize indirect calls SVF resolves completely (must run after
-  // DSAWrapper, which builds the SVF analysis it reuses; enforced via
-  // Devirtualize::getAnalysisUsage requiring DSAWrapper).
-  if (!SmackOptions::SkipDevirt)
-    passManager.add(makePass<Devirtualize>());
   passManager.add(makePass<SplitAggregateValue>());
 
   if (SmackOptions::MemorySafety)
@@ -289,6 +285,18 @@ void addSmackPreBplPasses(Module &module, legacy::PassManager &passManager,
         Machine->getTargetIRAnalysis()));
     passManager.add(makePass<AddTiming>());
   }
+
+  // Every pre-BPL transform has now run. Refuse to hand SVF/translation a
+  // module LLVM itself considers broken: a malformed instruction (e.g. the
+  // i64-struct-index GEP a MergeGEP off-by-one once minted) otherwise
+  // surfaces as an inscrutable SVF crash or a silent mistranslation.
+  passManager.add(createVerifierPass());
+
+  // Construct SVF only after every pointer-mutating pre-BPL transform. The
+  // separate -emit-devirt-bc path still runs Devirtualize directly on the
+  // pre-optimization module; this placement governs ordinary BPL emission.
+  if (!SmackOptions::SkipDevirt)
+    passManager.add(makePass<Devirtualize>());
 }
 
 void addSmackBplPasses(legacy::PassManager &passManager, raw_ostream &out,

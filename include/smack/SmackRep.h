@@ -64,6 +64,16 @@ protected:
   std::vector<std::string> initFuncs;
   std::map<std::string, Decl *> auxDecls;
 
+  // Bodyless "unknown callee" procedures backing indirect calls devirt could
+  // not resolve (one per return type). SmackModuleGenerator appends
+  // `modifies <every memory map>` to each after translation, so a call havocs
+  // all memory — the same conservative treatment external declarations get.
+  std::map<std::string, ProcDecl *> unknownCallProcs;
+
+  // Axioms fixing constant-global regions (-smack-const-regions): one
+  // `load(M,addr)==val` per skipped __SMACK_static_init store.
+  std::vector<const Expr *> constRegionAxiomExprs;
+
   // Track GEP-based pointer loads for annotation aliasing.
   // Key: string representation of the GEP address expression.
   // Value: Boogie variable name of the first loaded pointer (e.g., "$p15").
@@ -192,6 +202,20 @@ public:
   const Stmt *alloca(llvm::AllocaInst &i);
   const Stmt *memcpy(const llvm::MemCpyInst &msi);
   const Stmt *memset(const llvm::MemSetInst &msi);
+  const Stmt *unknownIndirectCall(const llvm::CallBase &CB);
+  std::list<ProcDecl *> unknownIndirectCallProcs();
+
+  // Const-region modeling (-smack-const-regions). A region is const-eligible
+  // when the flag is on and its component holds only constant globals.
+  bool isConstRegion(unsigned region);
+  bool isConstRegion(const llvm::Value *v);
+  // Record the store `M[addr]=val` (from __SMACK_static_init) as the axiom
+  // `load(M,addr)==val` instead of emitting a store statement; returns true if
+  // it consumed the store (region eligible), false to fall through to a store.
+  bool recordConstRegionStore(const llvm::StoreInst &SI);
+  const std::vector<const Expr *> &constRegionAxioms() const {
+    return constRegionAxiomExprs;
+  }
   const Expr *load(const llvm::Value *P);
   const Expr *load(const llvm::Value *P, const llvm::Type *T);
   const Expr *load(const llvm::LoadInst &I);
