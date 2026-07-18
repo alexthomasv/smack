@@ -8,7 +8,6 @@
 # Provides imported targets:
 #   smack::smackTranslator    — the core C++→Boogie translation library
 #   smack::utils              — utility LLVM passes (MergeGEP, SimplifyEV/IV)
-#   smack::SeaDsaAnalysis     — bundled sea-dsa analysis (from submodule)
 #
 # Also exposes:
 #   smack_VERSION             — package version (set from project())

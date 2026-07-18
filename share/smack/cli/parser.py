@@ -455,117 +455,7 @@ def arguments():
         '--no-memory-splitting',
         action="store_true",
         default=False,
-        help='disable region-based memory splitting',
-    )
-
-    translate_group.add_argument(
-        '--sea-dsa-mode',
-        choices=['ci', 'bu', 'butd-cs', 'cs', 'flat'],
-        default='bu',
-        help='select SeaDsa analysis mode for memory partitioning [default: %(default)s]',
-    )
-
-    translate_group.add_argument(
-        '--sea-dsa-type-aware',
-        action="store_true",
-        default=False,
-        help='enable SeaDsa type-aware mode (experimental)',
-    )
-
-    translate_group.add_argument(
-        '--memory-partitioner',
-        choices=['sea-dsa', 'cell-refined', 'aa-refined', 'svf-refined', 'svf-native'],
-        default='sea-dsa',
-        help='select SMACK memory partitioner [default: %(default)s]',
-    )
-
-    translate_group.add_argument(
-        '--memory-partition-oracle',
-        metavar='FILE',
-        default=None,
-        help='read external memory partition oracle JSON',
-    )
-
-    translate_group.add_argument(
-        '--svf-wpa',
-        metavar='FILE',
-        default=None,
-        help='SVF wpa executable for auto-generating SVF memory oracles '
-        '[default: SMACK_SVF_WPA or wpa]',
-    )
-
-    translate_group.add_argument(
-        '--svf-extapi',
-        metavar='FILE',
-        default=None,
-        help='SVF extapi.bc path for SVF oracle generation or in-process svf-native '
-        '[default: SMACK_SVF_EXTAPI]',
-    )
-
-    translate_group.add_argument(
-        '--svf-mem-par',
-        choices=['distinct', 'intra-disjoint', 'inter-disjoint'],
-        default=None,
-        help='SVF MemorySSA partition mode for SVF oracle generation or in-process svf-native '
-        '[default: SMACK_SVF_MEM_PAR or intra-disjoint]',
-    )
-
-    translate_group.add_argument(
-        '--svf-analysis',
-        choices=['ander'],
-        default=None,
-        help='SVF pointer analysis for in-process svf-native [default: ander]',
-    )
-
-    translate_group.add_argument(
-        '--svf-timeout',
-        metavar='N',
-        default=None,
-        type=int,
-        help='SVF oracle-generation timeout in seconds '
-        '[default: SMACK_SVF_TIMEOUT or 300]',
-    )
-
-    translate_group.add_argument(
-        '--svf-loop-frames',
-        action='store_true',
-        default=False,
-        help='emit SVF-derived loop frame invariants when complete',
-    )
-
-    translate_group.add_argument(
-        '--svf-call-frames',
-        action='store_true',
-        default=False,
-        help='enable SVF callsite frame facts where supported',
-    )
-
-    translate_group.add_argument(
-        '--svf-indirect-calls',
-        action='store_true',
-        default=False,
-        help='collect SVF indirect-call target facts in generated oracles',
-    )
-
-    translate_group.add_argument(
-        '--svf-loop-diagnostics',
-        action='store_true',
-        default=False,
-        help='collect SVF loop diagnostics in generated oracles',
-    )
-
-    translate_group.add_argument(
-        '--svf-saber-diagnostics',
-        action='store_true',
-        default=False,
-        help='reserve SVF SABER diagnostic collection in generated oracles',
-    )
-
-    translate_group.add_argument(
-        '--svf-mta-diagnostics',
-        action='store_true',
-        default=False,
-        help='reserve SVF MTA diagnostic collection in generated oracles',
+        help='disable SVF component splitting and use one universal memory map',
     )
 
     translate_group.add_argument(
@@ -647,7 +537,7 @@ def arguments():
         '--no-byte-access-inference',
         action="store_true",
         default=False,
-        help='disable bit-precision-related optimizations with DSA',
+        help='disable byte-access inference for memory maps',
     )
 
     translate_group.add_argument(

@@ -21,8 +21,7 @@ public:
   virtual bool runOnModule(llvm::Module &M) override;
   virtual void getAnalysisUsage(llvm::AnalysisUsage &AU) const override;
 
-  // Shared body for legacy + NewPM. Every initialized global is emitted: the
-  // SVF-backed DSAWrapper::isRead query was already unconditionally true.
+  // Shared body for legacy + NewPM. Every initialized global is emitted.
   static bool runImpl(llvm::Module &M);
 };
 

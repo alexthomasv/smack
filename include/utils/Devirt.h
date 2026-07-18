@@ -29,19 +29,31 @@
 
 #include <map>
 #include <set>
+#include <string>
 #include <vector>
 
 using namespace llvm;
 
 namespace llvm {
+
+// The target decision is computed for every original indirect call before the
+// first bounce mutates the module. This keeps every SVF query tied to the same
+// exact LLVM IR epoch.
+struct DevirtResolution {
+  bool complete = false;
+  bool flta = false;
+  bool rewriteSafe = true;
+  std::vector<const Function *> targets;
+  std::string reason;
+};
+
 //
 // Class: Devirtualize
 //
 // Description:
 //  This transform pass looks for indirect function calls and rewrites each one
-//  whose targets SVF resolves *completely* into a direct dispatch (a "bounce"
-//  function with an `if (fp == &target_i) call target_i(args)` chain ending in
-//  `unreachable`). Callsites SVF cannot completely resolve are left untouched.
+//  into a direct-target dispatch (a "bounce" function). Every bounce ends in
+//  the residual indirect call, so omitted targets retain unknown-callee havoc.
 //
 class DevirtualizeNewPM;
 class Devirtualize : public ModulePass, public InstVisitor<Devirtualize> {
@@ -55,28 +67,18 @@ private:
   std::vector<CallBase *> Worklist;
 
   // A cache of indirect-call bounce functions that have been built already.
-  // The bool records the fallback kind: true = FLTA bounce whose no-match
-  // branch performs the residual indirect call (unknown-callee model); false =
-  // completeness-gated bounce whose no-match branch is `unreachable`. The two
-  // are semantically different and must never be conflated by the cache.
   struct BounceInfo {
     std::set<const Function *> targets;
-    bool unknownFallback = false;
   };
   std::map<const Function *, BounceInfo> bounceCache;
 
-  // Functions enumerated as FLTA fallback targets. The dead-function stubber
-  // must treat these as live roots: the bounce dispatches to them on a
-  // dynamically taken edge SVF's call graph does not contain.
-  std::set<const Function *> fltaTargets;
+  bool Changed = false;
 
 protected:
-  void makeDirectCall(CallBase *CS, bool allowFlta);
-  Function *buildBounce(CallBase *CS, std::vector<const Function *> &Targets,
-                        bool unknownFallback);
+  void makeDirectCall(CallBase *CS, const DevirtResolution &resolution);
+  Function *buildBounce(CallBase *CS, std::vector<const Function *> &Targets);
   const Function *findInCache(const CallBase *CS,
-                              std::set<const Function *> &Targets,
-                              bool unknownFallback);
+                              std::set<const Function *> &Targets);
 
 public:
   static char ID;

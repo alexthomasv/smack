@@ -759,12 +759,9 @@ void SmackModuleGenerator::generateProgramImpl(
     // ... added below, after body generation has discovered late maps too.
   }
 
-  // MODIFIES: every procedure conservatively modifies all memory maps. (The
-  // SVF/oracle path previously narrowed this per-function; with sea-dsa removed
-  // we restore the sound default — Boogie procedures must declare every region
-  // they may touch, and SMACK inlines into entry points so the over-approx is
-  // harmless.) Build the region list once after instruction generation has
-  // discovered all regions.
+  // MODIFIES: every procedure conservatively modifies every memory map.
+  // Boogie procedures must declare every map they may touch; over-approximating
+  // a frame is sound.
   std::list<std::string> allMemoryMaps;
   for (const auto &memoryMap : rep.memoryMaps())
     allMemoryMaps.push_back(memoryMap.first);
@@ -785,12 +782,6 @@ void SmackModuleGenerator::generateProgramImpl(
       proc->getModifies().push_back(mod);
     decls.insert(decls.end(), proc);
   }
-
-  // Const-region axioms (-smack-const-regions): each fixes one cell of a
-  // constant-global `const` map (load(M,addr)==val), replacing the elided
-  // __SMACK_static_init stores. Collected during body generation above.
-  for (const Expr *ax : rep.constRegionAxioms())
-    decls.insert(decls.end(), Decl::axiom(ax));
 
   auto ds = rep.auxiliaryDeclarations();
   decls.insert(decls.end(), ds.begin(), ds.end());

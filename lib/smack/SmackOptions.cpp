@@ -66,31 +66,17 @@ const llvm::cl::opt<bool> SmackOptions::RewriteBitwiseOps(
 
 const llvm::cl::opt<bool> SmackOptions::NoMemoryRegionSplitting(
     "no-memory-splitting",
-    llvm::cl::desc("Disable splitting memory into regions."));
+    llvm::cl::desc("Disable SVF splitting and use one universal memory map."),
+    llvm::cl::init(false));
 
 const llvm::cl::opt<bool> SmackOptions::SkipDevirt(
     "smack-skip-devirt",
     llvm::cl::desc("Skip SVF-based devirtualization of indirect function calls."),
     llvm::cl::init(false));
 
-const llvm::cl::opt<bool> SmackOptions::SvfFieldWindows(
-    "svf-field-windows",
-    llvm::cl::desc("Field-granular memory regions: split a may-alias "
-                   "component into byte-window sub-regions where accesses "
-                   "have proven constant offsets (SMACK_SVF_WINDOWS=1 also "
-                   "enables)."),
-    llvm::cl::init(false));
-
-const llvm::cl::opt<bool> SmackOptions::ConstRegions(
-    "smack-const-regions",
-    llvm::cl::desc("Model constant-global-only regions as Boogie `const` maps "
-                   "fixed by axioms (skips their __SMACK_static_init stores). "
-                   "VERIFIER-ONLY: the interpreter cannot consume the axioms."),
-    llvm::cl::init(false));
-
 const llvm::cl::opt<bool> SmackOptions::NoByteAccessInference(
     "no-byte-access-inference",
-    llvm::cl::desc("Optimize bit-precision with DSA."));
+    llvm::cl::desc("Force bytewise memory maps in bit-precise mode."));
 
 const llvm::cl::opt<bool> SmackOptions::FloatEnabled(
     "float", llvm::cl::desc("Enable interpreted floating-point type"));

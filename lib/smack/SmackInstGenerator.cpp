@@ -16,6 +16,7 @@
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/InstVisitor.h"
 #include <fstream>
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/GraphWriter.h"
 #include "smack/Regions.h"
 #include <iterator>
@@ -42,7 +43,7 @@ const size_t MAX_PROVENANCE_ATTR_VALUE = 2048;
 Regex VAR_DECL("^[[:space:]]*var[[:space:]]+([[:alpha:]_.$#'`~^\\?][[:alnum:]_."
                "$#'`~^\\?]*):.*;");
 
-// Procedures whose return value should not be marked as external
+// Procedures whose return value should not be marked as external.
 Regex EXTERNAL_PROC_IGNORE("^(malloc|__VERIFIER_nondet)$");
 
 std::string i2s(const llvm::Instruction &i) {
@@ -804,19 +805,25 @@ void SmackInstGenerator::addLoopInvariantChecks(Block *block,
             loopAttrs(loop, "invariant_check"));
 }
 
-std::string SmackInstGenerator::getSourceLine(const std::string &filename,
-                                               unsigned line) {
+std::string SmackInstGenerator::getSourceLine(const std::string &directory,
+                                              const std::string &filename,
+                                              unsigned line) {
   if (line == 0)
     return "";
-  auto it = sourceLineCache.find(filename);
+  const std::string cacheKey = directory + "\n" + filename;
+  auto it = sourceLineCache.find(cacheKey);
   if (it == sourceLineCache.end()) {
-    // Try to read the file from multiple candidate paths
+    // DIFile::directory records the compile-time base for relative filenames.
+    // Prefer it over the translator's current working directory so identical
+    // bitcode emits identical c_line metadata from CMake and direct
+    // invocations.
     std::vector<std::string> lines;
-    std::vector<std::string> candidates = {
-      filename,
-      "../" + filename,           // from build/ up to examples/
-      "../../" + filename,        // from build/ up to project root
-    };
+    std::vector<std::string> candidates;
+    if (!directory.empty() && !filename.empty() && filename.front() != '/')
+      candidates.push_back(directory + "/" + filename);
+    candidates.push_back(filename);
+    candidates.push_back("../" + filename);
+    candidates.push_back("../../" + filename);
     for (auto &path : candidates) {
       std::ifstream ifs(path);
       if (ifs.is_open()) {
@@ -826,7 +833,7 @@ std::string SmackInstGenerator::getSourceLine(const std::string &filename,
         break;
       }
     }
-    it = sourceLineCache.emplace(filename, std::move(lines)).first;
+    it = sourceLineCache.emplace(cacheKey, std::move(lines)).first;
   }
   auto &lines = it->second;
   if (line <= lines.size()) {
@@ -882,11 +889,12 @@ void SmackInstGenerator::annotate(llvm::Instruction &I, Block *B) {
     const DebugLoc DL = I.getDebugLoc();
     auto *scope = cast<DIScope>(DL.getScope());
     std::string filename = scope->getFilename().str();
+    std::string directory = scope->getDirectory().str();
     unsigned line = DL.getLine();
     B->addStmt(Stmt::annot(Attr::attr("sourceloc", filename,
                                       line, DL.getCol())));
     // Embed the actual C source line text
-    std::string srcLine = getSourceLine(filename, line);
+    std::string srcLine = getSourceLine(directory, filename, line);
     if (!srcLine.empty()) {
       B->addStmt(Stmt::annot(Attr::attr("c_line", srcLine)));
     }
@@ -1250,13 +1258,31 @@ void SmackInstGenerator::visitSwitchInst(llvm::SwitchInst &si) {
   generateGotoStmts(si, targets);
 }
 
+static void rejectUnsupportedReturnsTwice(const llvm::CallBase &call,
+                                          const llvm::Function *callee);
+
 void SmackInstGenerator::visitInvokeInst(llvm::InvokeInst &ii) {
   processInstruction(ii);
   llvm::Function *f = ii.getCalledFunction();
-  if (f)
+  if (!f) {
+    llvm::Value *callee = ii.getCalledOperand();
+    if (callee)
+      callee = callee->stripPointerCastsAndAliases();
+    if (callee && llvm::isa<llvm::Function>(callee)) {
+      f = llvm::cast<llvm::Function>(callee);
+    } else {
+      rejectUnsupportedReturnsTwice(ii, nullptr);
+      SmackWarnings::warnApproximate(
+          "unresolved indirect invoke in " +
+              ii.getFunction()->getName().str() + ": " + i2s(ii),
+          currBlock, &ii);
+      emit(rep->unknownIndirectCall(ii));
+    }
+  }
+  if (f) {
+    rejectUnsupportedReturnsTwice(ii, f);
     emit(rep->call(f, ii));
-  else
-    llvm_unreachable("Unexpected invoke instruction.");
+  }
 
   std::vector<std::pair<const Expr *, llvm::BasicBlock *>> targets;
   targets.push_back(
@@ -1507,11 +1533,6 @@ void SmackInstGenerator::visitStoreInst(llvm::StoreInst &si) {
     auto M = Expr::id(rep->memPath(R));
     auto E = Expr::fn(D->getName(), {M, rep->expr(P), rep->expr(V)});
     emit(Stmt::assign(M, E), storeAttrs);
-  } else if (rep->recordConstRegionStore(si)) {
-    // -smack-const-regions: this static-init store into a constant-global
-    // region became a module-level axiom (load(M,addr)==val); the `const` map
-    // needs no store statement. Emit a marker comment for traceability.
-    emit(Stmt::comment("const-region store elided (see axiom)"), storeAttrs);
   } else {
     emit(rep->store(si), storeAttrs);
     if (const Stmt *inverseAssume = rep->inverseFPCastAssume(&si)) {
@@ -1635,14 +1656,52 @@ void SmackInstGenerator::visitSelectInst(llvm::SelectInst &i) {
   emit(Stmt::assign(Expr::id(x), E));
 }
 
+static bool returnsTwiceCallShape(const llvm::CallBase &call,
+                                  const llvm::Function &target) {
+  const llvm::FunctionType *type = target.getFunctionType();
+  if (target.getCallingConv() != call.getCallingConv() ||
+      type->getReturnType() != call.getType() ||
+      call.arg_size() < type->getNumParams() ||
+      (call.arg_size() > type->getNumParams() && !target.isVarArg()))
+    return false;
+  for (unsigned index = 0; index < type->getNumParams(); ++index)
+    if (call.getArgOperand(index)->getType() != type->getParamType(index))
+      return false;
+  return true;
+}
+
+static const llvm::Function *
+potentialReturnsTwiceTarget(const llvm::CallBase &call) {
+  for (const llvm::Function &target : *call.getModule())
+    if (target.hasFnAttribute(llvm::Attribute::ReturnsTwice) &&
+        target.hasAddressTaken() && returnsTwiceCallShape(call, target))
+      return &target;
+  return nullptr;
+}
+
+static void rejectUnsupportedReturnsTwice(const llvm::CallBase &call,
+                                          const llvm::Function *callee) {
+  const llvm::Function *target =
+      callee && callee->hasFnAttribute(llvm::Attribute::ReturnsTwice)
+          ? callee
+          : (!callee ? potentialReturnsTwiceTarget(call) : nullptr);
+  if (!call.hasFnAttr(llvm::Attribute::ReturnsTwice) && !target)
+    return;
+  const std::string targetName = target ? target->getName().str() : "<unknown>";
+  llvm::report_fatal_error(
+      llvm::Twine(
+          "SMACK cannot soundly translate returns_twice control flow at ") +
+      call.getFunction()->getName().str() + " (possible target " + targetName +
+      "); refusing to model a nonlocal second return as an ordinary call");
+}
+
 void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
   processInstruction(ci);
 
   if (ci.isInlineAsm()) {
-    SmackWarnings::warnApproximate("inline asm call " + i2s(ci), currBlock,
-                                   &ci);
-    emit(Stmt::skip());
-    return;
+    llvm::report_fatal_error(
+        "SMACK cannot soundly translate inline assembly; refusing to erase "
+        "its return value, memory effects, or control effects");
   }
 
   Function *f = ci.getCalledFunction();
@@ -1654,6 +1713,7 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     if (callee && isa<Function>(callee)) {
       f = cast<Function>(callee);
     } else {
+      rejectUnsupportedReturnsTwice(ci, nullptr);
       // SVF devirt could not resolve this indirect call to a concrete Function
       // (incomplete/black-hole points-to, so the devirt left it untouched).
       // Model the unknown callee like a bodyless external declaration: the
@@ -1671,7 +1731,20 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
     }
   }
 
+  rejectUnsupportedReturnsTwice(ci, f);
+
   StringRef name = f->hasName() ? f->getName() : "";
+
+  // Lifetime intrinsics only delimit when an LLVM allocation's contents are
+  // live. Erasing the marker retains more possible memory states and is
+  // therefore a sound over-approximation. In particular, do not lower it as a
+  // modular Boogie call: that would spuriously havoc every partition map.
+  if (f->isIntrinsic() &&
+      (f->getIntrinsicID() == llvm::Intrinsic::lifetime_start ||
+       f->getIntrinsicID() == llvm::Intrinsic::lifetime_end)) {
+    emit(Stmt::skip());
+    return;
+  }
 
   if (SmackOptions::RustPanics && name == Naming::RUST_PANIC_MARKER &&
       SmackOptions::shouldCheckFunction(
@@ -2004,7 +2077,11 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
 
   if (f->isDeclaration()) {
     std::string name = naming->get(*f);
-    if (!EXTERNAL_PROC_IGNORE.match(name) && rep->isExternal(&ci))
+    const bool valueAnnotation =
+        f->hasName() &&
+        f->getName().find(Naming::VALUE_PROC) != StringRef::npos;
+    if (!valueAnnotation && !EXTERNAL_PROC_IGNORE.match(name) &&
+        rep->isExternal(&ci))
       emit(Stmt::assume(Expr::fn(Naming::EXTERNAL_ADDR, rep->expr(&ci))));
   }
 
@@ -2018,9 +2095,9 @@ void SmackInstGenerator::visitCallInst(llvm::CallInst &ci) {
 
 void SmackInstGenerator::visitCallBrInst(llvm::CallBrInst &cbi) {
   processInstruction(cbi);
-  SmackWarnings::warnApproximate("callbr instruction " + i2s(cbi), currBlock,
-                                 &cbi);
-  emit(Stmt::skip());
+  llvm::report_fatal_error(
+      "SMACK cannot soundly translate callbr; refusing to erase its call "
+      "effects or indirect control-flow destinations");
 }
 
 bool isSourceLoc(const Stmt *stmt) {
@@ -2450,6 +2527,8 @@ void SmackInstGenerator::visitIntrinsicInst(llvm::IntrinsicInst &ii) {
           {llvm::Intrinsic::cttz, cttz},
           {llvm::Intrinsic::dbg_declare, ignore},
           {llvm::Intrinsic::dbg_label, ignore},
+          {llvm::Intrinsic::lifetime_start, ignore},
+          {llvm::Intrinsic::lifetime_end, ignore},
           {llvm::Intrinsic::expect, identity},
           {llvm::Intrinsic::fabs, assignUnFPFuncApp("$abs")},
           {llvm::Intrinsic::fma, fma},

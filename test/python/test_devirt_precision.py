@@ -1,28 +1,28 @@
-import importlib.util
 import json
+import re
+import shutil
 import subprocess
-import sys
 
 from smack_test_paths import (
     REPO_ROOT,
-    clang_path,
-    clangxx_path,
-    llvm_link_path,
     run_with_timeout,
     tool_path,
 )
 
 
-def load_svf_adapter_module():
-    module_path = REPO_ROOT / "tools" / "svf_memory_partition_adapter.py"
-    spec = importlib.util.spec_from_file_location("svf_memory_partition_adapter", module_path)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
+def matching_llvm_tool(name):
+    version = subprocess.run(
+        [tool_path("llvm2bpl"), "--version"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    ).stdout
+    match = re.search(r"LLVM version (\d+)", version)
+    assert match, version
+    path = shutil.which(f"{name}-{match.group(1)}")
+    assert path, f"{name} for {version.strip()} not found"
+    return path
 
 def compile_source_to_linked_bc(tmp_path, name, source, *, cxx=False):
     suffix = "cpp" if cxx else "c"
@@ -32,7 +32,7 @@ def compile_source_to_linked_bc(tmp_path, name, source, *, cxx=False):
     linked = tmp_path / f"{name}-linked.bc"
     src.write_text(source)
 
-    compiler = clangxx_path() if cxx else clang_path()
+    compiler = matching_llvm_tool("clang++" if cxx else "clang")
     cmd = [
         compiler,
         "-O0",
@@ -58,7 +58,7 @@ def compile_source_to_linked_bc(tmp_path, name, source, *, cxx=False):
 
     run_with_timeout(
         [
-            clang_path(),
+            matching_llvm_tool("clang"),
             "-O0",
             "-g",
             "-emit-llvm",
@@ -77,7 +77,7 @@ def compile_source_to_linked_bc(tmp_path, name, source, *, cxx=False):
     )
 
     run_with_timeout(
-        [llvm_link_path(), str(bc), str(runtime_bc), "-o", str(linked)],
+        [matching_llvm_tool("llvm-link"), str(bc), str(runtime_bc), "-o", str(linked)],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -88,28 +88,6 @@ def compile_source_to_linked_bc(tmp_path, name, source, *, cxx=False):
     return linked
 
 
-def emit_pre_bpl_ll(tmp_path, name, linked, *, entry="f"):
-    pre_ll = tmp_path / f"{name}.pre.ll"
-    completed = run_with_timeout(
-        [
-            tool_path("llvm2bpl"),
-            "-smack-memory-partitioner=sea-dsa",
-            "-smack-skip-devirt",
-            f"--ll={pre_ll}",
-            f"--entry-points={entry}",
-            str(linked),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-        timeout_name="SMACK_TOOL",
-        default_timeout=120,
-    )
-    assert completed.returncode == 0, completed.stdout
-    return pre_ll
-
-
 def run_with_devirt_report(tmp_path, name, source, *, entry="f", cxx=False):
     linked = compile_source_to_linked_bc(tmp_path, name, source, cxx=cxx)
     report = tmp_path / f"{name}.devirt.json"
@@ -117,7 +95,6 @@ def run_with_devirt_report(tmp_path, name, source, *, entry="f", cxx=False):
     completed = run_with_timeout(
         [
             tool_path("llvm2bpl"),
-            "-smack-memory-partitioner=sea-dsa",
             f"-smack-devirt-report={report}",
             f"--bpl={bpl}",
             f"--entry-points={entry}",
@@ -132,6 +109,41 @@ def run_with_devirt_report(tmp_path, name, source, *, entry="f", cxx=False):
     )
     assert completed.returncode == 0, completed.stdout
     return json.loads(report.read_text())
+
+
+def emit_devirt(tmp_path, name, linked, *, entry="f"):
+    report = tmp_path / f"{name}.devirt.json"
+    output = tmp_path / f"{name}.devirt.bc"
+    completed = run_with_timeout(
+        [
+            tool_path("llvm2bpl"),
+            str(linked),
+            f"-emit-devirt-bc={output}",
+            f"-smack-devirt-report={report}",
+            f"-entry-points={entry}",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        timeout_name="SMACK_TOOL",
+        default_timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout
+    return json.loads(report.read_text()), output
+
+
+def disassemble(bitcode):
+    completed = run_with_timeout(
+        [matching_llvm_tool("llvm-dis"), str(bitcode), "-o", "-"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout_name="LLVM",
+        default_timeout=60,
+    )
+    return completed.stdout
 
 
 def test_devirt_report_resolves_constant_function_pointer_table(tmp_path):
@@ -149,13 +161,13 @@ int f(int x) {
 """
     data = run_with_devirt_report(tmp_path, "fp_table", source)
 
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert all("callsite_id" in call for call in data["callsites"])
     assert any(
         call["complete"]
         and call["target_count"] == 1
         and call["targets"] == ["only"]
-        and call["source"] in {"sea-dsa", "type-dataflow"}
+        and call["reason"] == "svf-complete"
         for call in data["callsites"]
     ), data
 
@@ -178,75 +190,10 @@ int f(int x) {
     data = run_with_devirt_report(tmp_path, "fp_external_source", source)
 
     assert any(
-        call["source"] == "fallback"
-        and not call["complete"]
-        and call["fallback_target_count"] >= 2
-        for call in data["callsites"]
-    ), data
-
-
-def test_devirt_uses_complete_svf_indirect_target_oracle(tmp_path):
-    adapter = load_svf_adapter_module()
-    source = """
-typedef int (*fp_t)(int);
-extern fp_t unknown_fp(void);
-int only(int x) { return x + 1; }
-int other(int x) { return x + 2; }
-fp_t keep = other;
-fp_t keep2 = only;
-int f(int x) {
-  if (x == 12345) return keep(x);
-  if (x == 54321) return keep2(x);
-  fp_t p = unknown_fp();
-  return p(x);
-}
-"""
-    linked = compile_source_to_linked_bc(tmp_path, "fp_svf_oracle", source)
-    pre_ll = emit_pre_bpl_ll(tmp_path, "fp_svf_oracle", linked)
-    ll_text = pre_ll.read_text()
-    oracle = adapter.build_oracle(ll_text=ll_text, svf_output="")
-    indirect_calls = [
-        call
-        for call in adapter.iter_module_call_infos(ll_text)
-        if call.function == "f" and call.indirect
-    ]
-    assert indirect_calls
-    oracle["indirect_call_targets"] = {
-        call.key: {"targets": ["only"], "complete": True} for call in indirect_calls
-    }
-    oracle["stats"]["indirect_call_target_count"] = len(indirect_calls)
-
-    oracle_path = tmp_path / "fp_svf_oracle.oracle.json"
-    report = tmp_path / "fp_svf_oracle.devirt.json"
-    bpl = tmp_path / "fp_svf_oracle.bpl"
-    oracle_path.write_text(json.dumps(oracle, indent=2, sort_keys=True) + "\n")
-
-    completed = run_with_timeout(
-        [
-            tool_path("llvm2bpl"),
-            "-smack-memory-partitioner=svf-refined",
-            f"-smack-memory-partition-oracle={oracle_path}",
-            f"-smack-devirt-report={report}",
-            f"--bpl={bpl}",
-            "--entry-points=f",
-            str(linked),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-        timeout_name="SMACK_TOOL",
-        default_timeout=120,
-    )
-    assert completed.returncode == 0, completed.stdout
-    data = json.loads(report.read_text())
-
-    assert any(
-        call["source"] == "svf"
-        and call["complete"]
-        and call["targets"] == ["only"]
-        and call["svf_complete"]
-        and call["svf_targets"] == ["only"]
+        not call["complete"]
+        and call["flta"]
+        and call["target_count"] >= 2
+        and call["reason"].startswith("flta:")
         for call in data["callsites"]
     ), data
 
@@ -279,3 +226,120 @@ extern "C" int f(int c) {
     assert virtual_calls, data
     assert all("other" not in target for call in virtual_calls for target in call["targets"])
     assert any(call["target_count"] <= 2 for call in virtual_calls)
+
+
+def test_devirt_report_indices_are_local_to_each_function(tmp_path):
+    source = """
+typedef int (*fp_t)(int);
+int left(int x) { return x + 1; }
+int right(int x) { return x + 2; }
+fp_t left_slot = left;
+fp_t right_slot = right;
+int f(int x) { return left_slot(x); }
+int g(int x) { return right_slot(x); }
+"""
+    linked = compile_source_to_linked_bc(tmp_path, "function_local_ids", source)
+    data, _ = emit_devirt(tmp_path, "function_local_ids", linked)
+    ids = {call["callsite_id"] for call in data["callsites"]}
+    assert "f:indirect:0" in ids
+    assert "g:indirect:0" in ids
+
+
+def test_devirt_declines_returns_twice_target_and_translation_fails_closed(tmp_path):
+    source = """
+typedef int (*fp_t)(void *);
+extern int __attribute__((returns_twice)) rt(void *);
+fp_t slot = rt;
+int f(void *env) { return slot(env); }
+"""
+    linked = compile_source_to_linked_bc(tmp_path, "returns_twice", source)
+    data, output = emit_devirt(tmp_path, "returns_twice", linked)
+    call = next(call for call in data["callsites"] if call["function"] == "f")
+    assert call["reason"] == "unsupported-target:returns-twice:rt"
+    assert not call["complete"]
+    assert "devirtbounce" not in disassemble(output)
+
+    completed = run_with_timeout(
+        [
+            tool_path("llvm2bpl"),
+            str(linked),
+            "--entry-points=f",
+            f"--bpl={tmp_path / 'returns_twice.bpl'}",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        timeout_name="SMACK_TOOL",
+        default_timeout=120,
+    )
+    assert completed.returncode != 0
+    assert "cannot soundly translate returns_twice control flow" in completed.stdout
+
+
+def test_devirt_declines_invoke_instead_of_swallowing_exception_state(tmp_path):
+    source = tmp_path / "indirect_invoke.ll"
+    source.write_text(
+        r"""
+target triple = "x86_64-unknown-linux-gnu"
+
+@slot = global ptr @target
+
+declare i32 @__gxx_personality_v0(...)
+
+define i32 @target() {
+entry:
+  ret i32 7
+}
+
+define i32 @f() personality ptr @__gxx_personality_v0 {
+entry:
+  %callee = load ptr, ptr @slot
+  %value = invoke i32 %callee()
+          to label %normal unwind label %exception
+normal:
+  ret i32 %value
+exception:
+  %landing = landingpad { ptr, i32 } cleanup
+  ret i32 -1
+}
+"""
+    )
+    data, output = emit_devirt(tmp_path, "indirect_invoke", source)
+    call = next(call for call in data["callsites"] if call["function"] == "f")
+    assert call["reason"] == "unsupported-callsite:invoke"
+    assert not call["complete"]
+    ir = disassemble(output)
+    assert "invoke i32 %callee()" in ir
+    assert "devirtbounce" not in ir
+
+
+def test_devirt_declines_caller_sensitive_target(tmp_path):
+    source = """
+typedef void *(*fp_t)(void);
+void *target(void) { return __builtin_return_address(0); }
+fp_t slot = target;
+void *f(void) { return slot(); }
+"""
+    linked = compile_source_to_linked_bc(tmp_path, "caller_sensitive", source)
+    data, output = emit_devirt(tmp_path, "caller_sensitive", linked)
+    call = next(call for call in data["callsites"] if call["function"] == "f")
+    assert call["reason"] == "unsupported-target:caller-sensitive:target"
+    assert not call["complete"]
+    assert "devirtbounce" not in disassemble(output)
+
+
+def test_devirt_does_not_rewrite_its_residual_calls(tmp_path):
+    source = """
+typedef int (*fp_t)(int);
+int target(int x) { return x + 1; }
+fp_t slot = target;
+int f(int x) { return slot(x); }
+"""
+    linked = compile_source_to_linked_bc(tmp_path, "idempotent", source)
+    _, first = emit_devirt(tmp_path, "idempotent_first", linked)
+    _, second = emit_devirt(tmp_path, "idempotent_second", first)
+    first_ir = disassemble(first)
+    second_ir = disassemble(second)
+    assert len(re.findall(r"define internal .*@devirtbounce", first_ir)) == 1
+    assert len(re.findall(r"define internal .*@devirtbounce", second_ir)) == 1

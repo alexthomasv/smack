@@ -165,8 +165,6 @@ TargetMachine *getTargetMachine(Triple TheTriple, StringRef CPUStr,
 void configureModule(Module &module, const SmackPipelineOptions &options) {
   if (module.getDataLayoutStr().empty())
     module.setDataLayout(options.defaultDataLayout);
-  // The memory-region partition is now produced unconditionally by the
-  // SVF-Andersen-backed DSAWrapper; there is no partitioner selection knob.
 }
 
 } // namespace
@@ -295,13 +293,23 @@ void addSmackPreBplPasses(Module &module, legacy::PassManager &passManager,
   // Construct SVF only after every pointer-mutating pre-BPL transform. The
   // separate -emit-devirt-bc path still runs Devirtualize directly on the
   // pre-optimization module; this placement governs ordinary BPL emission.
-  if (!SmackOptions::SkipDevirt)
+  if (!SmackOptions::SkipDevirt && !options.skipDevirtualization) {
     passManager.add(makePass<Devirtualize>());
+    passManager.add(createVerifierPass());
+  }
 }
 
 void addSmackBplPasses(legacy::PassManager &passManager, raw_ostream &out,
                        const SmackBplOptions &options) {
   initializeSmackPipelinePasses();
+  if (options.forceUniversalMemory)
+    passManager.add(new Regions(true));
+  else if (!SmackOptions::NoMemoryRegionSplitting)
+    // DSAWrapper's first SVF construction normalizes LLVM IR. Materialize it
+    // before the verifier and before Generator requests LoopInfo/Regions, even
+    // when devirtualization was explicitly skipped.
+    passManager.add(makePass<DSAWrapper>());
+  passManager.add(createVerifierPass());
   passManager.add(makePass<SmackModuleGenerator>(
       options.structuredLoops, options.structuredLoopsStrict,
       options.memoryPartitionReport));
@@ -321,6 +329,7 @@ void runSmackTierANewPM(Module &module, const SmackPipelineOptions &options) {
   PB.registerFunctionAnalyses(FAM);
   PB.registerLoopAnalyses(LAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return DSAWrapperAnalysis(); });
 
   ModulePassManager MPM;
 
@@ -361,10 +370,6 @@ void runSmackTierANewPM(Module &module, const SmackPipelineOptions &options) {
     MPM.addPass(RemoveDeadDefsNewPM());
   }
   MPM.addPass(MergeArrayGEPNewPM());
-  // Devirtualize indirect calls (NewPM parity; DSAWrapperAnalysis, registered
-  // above, builds the SVF analysis it reuses).
-  if (!SmackOptions::SkipDevirt)
-    MPM.addPass(llvm::DevirtualizeNewPM());
 
   {
     FunctionPassManager FPM;
@@ -392,6 +397,14 @@ void runSmackTierANewPM(Module &module, const SmackPipelineOptions &options) {
     MPM.addPass(RewriteBitwiseOpsNewPM());
   }
 
+  // SVF is an exact-IR-epoch analysis. Check the final transform input and the
+  // normalized/devirtualized result before returning it to another pass
+  // manager.
+  MPM.addPass(llvm::VerifierPass());
+  if (!SmackOptions::SkipDevirt && !options.skipDevirtualization)
+    MPM.addPass(llvm::DevirtualizeNewPM());
+  MPM.addPass(llvm::VerifierPass());
+
   MPM.run(module, MAM);
 }
 
@@ -407,7 +420,7 @@ void runSmackPreBplPipeline(Module &module,
 }
 
 // Full NewPM path mirrors the legacy pre-BPL ordering, including the stock
-// LLVM cleanup/lowering passes before sea-dsa-sensitive SMACK passes. Keep this
+// LLVM cleanup/lowering passes before pointer-sensitive SMACK passes. Keep this
 // opt-in until corpus-level legacy-vs-NewPM BPL equivalence remains green in CI.
 void runSmackFullNewPM(Module &module, raw_ostream &out,
                        const SmackPipelineOptions &options,
@@ -440,9 +453,11 @@ void runSmackFullNewPM(Module &module, raw_ostream &out,
   PB.registerLoopAnalyses(LAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-  // Tier C/D analyses: SVF-backed DSAWrapper + Regions bridges.
+  // DSAWrapperAnalysis supplies one SVF result to both devirtualization and
+  // component-only memory partitioning.
   MAM.registerPass([&] { return DSAWrapperAnalysis(); });
-  MAM.registerPass([&] { return RegionsAnalysis(); });
+  MAM.registerPass(
+      [&] { return RegionsAnalysis(bplOptions.forceUniversalMemory); });
   MAM.registerPass([&] {
     return SmackModuleGeneratorAnalysis(bplOptions.memoryPartitionReport);
   });
@@ -457,8 +472,8 @@ void runSmackFullNewPM(Module &module, raw_ostream &out,
   }
 
   // H1: stock LLVM transforms that legacy addSmackPreBplPasses runs before
-  // sea-dsa. Without these, NewPM full pipeline sees un-transformed IR and
-  // produces a different DSA partition (e.g. simple.c 47 vs 2 regions).
+  // SVF. Without these, NewPM would analyze untransformed IR and could produce
+  // a different Andersen component partition.
   if (!options.modular) {
     auto PreserveKeyGlobals = [=](const GlobalValue &GV) {
       auto name = GV.getName();
@@ -537,6 +552,22 @@ void runSmackFullNewPM(Module &module, raw_ostream &out,
   if (SmackOptions::RewriteBitwiseOps &&
       !(SmackOptions::BitPrecise || SmackOptions::BitPrecisePointers))
     MPM.addPass(RewriteBitwiseOpsNewPM());
+
+  // Validate the final transform input. DevirtualizeNewPM materializes SVF and
+  // invalidates all analyses itself. In skip-devirt mode, explicitly
+  // materialize SVF, then discard every pre-normalization analysis result.
+  MPM.addPass(llvm::VerifierPass());
+  const bool doDevirtualize =
+      !SmackOptions::SkipDevirt && !options.skipDevirtualization;
+  if (doDevirtualize) {
+    MPM.addPass(llvm::DevirtualizeNewPM());
+  } else if (!bplOptions.forceUniversalMemory &&
+             !SmackOptions::NoMemoryRegionSplitting) {
+    MPM.addPass(
+        llvm::RequireAnalysisPass<DSAWrapperAnalysis, llvm::Module>());
+    MPM.addPass(llvm::InvalidateAllAnalysesPass());
+  }
+  MPM.addPass(llvm::VerifierPass());
 
   // Tier D sink: emit Boogie.
   MPM.addPass(BplFilePrinterNewPM(out));

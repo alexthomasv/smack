@@ -507,7 +507,7 @@ TEST(NewPMFullPipeline, EquivalentBplVsLegacyOnMinimalModule) {
   EXPECT_NE(legacyBpl.find("procedure"), std::string::npos);
   EXPECT_NE(newpmBpl.find("procedure"), std::string::npos);
   // Strict byte-equivalence on the small synthetic input. If this ever
-  // diverges, sea-dsa state or pass scheduling differs between the two.
+  // diverges, SVF state or pass scheduling differs between the two.
   EXPECT_EQ(legacyBpl, newpmBpl);
 }
 
@@ -586,7 +586,7 @@ TEST(NewPMTierD, BplFilePrinterEmitsBoogieFromMinimalModule) {
   EXPECT_NE(bplOut.find("procedure"), std::string::npos);
 }
 
-TEST(NewPMTierC, RegionsAnalysisRunsViaDSAWrapper) {
+TEST(NewPMTierC, RegionsAnalysisUsesUniversalMap) {
   constexpr const char *kIR = R"IR(
     @g = global i32 0
 
@@ -614,12 +614,11 @@ TEST(NewPMTierC, RegionsAnalysisRunsViaDSAWrapper) {
   PB.registerFunctionAnalyses(FAM);
   PB.registerLoopAnalyses(LAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-  MAM.registerPass([&] { return smack::DSAWrapperAnalysis(); });
-  MAM.registerPass([&] { return smack::RegionsAnalysis(); });
+  MAM.registerPass([&] { return smack::RegionsAnalysis(true); });
 
   auto &regions = MAM.getResult<smack::RegionsAnalysis>(*M);
   ASSERT_NE(regions.regions.get(), nullptr);
-  EXPECT_GE(regions->size(), 0u);
+  EXPECT_EQ(regions->size(), 1u);
 }
 
 TEST(NewPMTierC, DSAWrapperAnalysisRunsOnTrivialModule) {
@@ -647,16 +646,12 @@ TEST(NewPMTierC, DSAWrapperAnalysisRunsOnTrivialModule) {
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
   MAM.registerPass([&] { return smack::DSAWrapperAnalysis(); });
 
-  // Pulling the result must instantiate the legacy DSA pipeline + DSAWrapper.
+  // Pulling the result must instantiate a usable carrier. SVF is intentionally
+  // process-global and belongs to the first Module analyzed in this test
+  // binary, so a later module may soundly receive the universal component.
   auto &result = MAM.getResult<smack::DSAWrapperAnalysis>(*M);
   ASSERT_NE(result.wrapper, nullptr);
-
-  // Probe at least one query interface to confirm the wrapper has live state.
-  auto *G = M->getGlobalVariable("g");
-  ASSERT_NE(G, nullptr);
-  // getNode may be nullptr for some IR shapes — accept either; the
-  // important contract is that the call doesn't crash.
-  (void)result.getNode(G);
+  EXPECT_NE(result.wrapper->getNode(M->getGlobalVariable("g")), nullptr);
 }
 
 TEST(NewPMEquivalence, MergeArrayGEPSingle) {

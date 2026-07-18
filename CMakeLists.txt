@@ -60,12 +60,9 @@ execute_process(
   OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
-# Phase A3: per-target include directories. Previously these were two global
-# `include_directories(include)` + `include_directories(sea-dsa/include)`
-# calls that polluted every CMake target in the tree. Each SMACK target now
-# gains the include search paths it actually needs via `target_include_directories`.
-# sea-dsa/include is added via `target_include_directories(SeaDsaAnalysis ...)`
-# after add_subdirectory below.
+# Per-target include directories keep each CMake target limited to the headers
+# it actually consumes. Memory partitioning and devirtualization use the SVF
+# targets linked below; there is no SeaDsa analysis target in this build.
 function(smack_force_llvm_compat target)
   target_compile_options(${target} PRIVATE
     "-include" "${SMACK_LLVM_COMPAT_HEADER}")
@@ -191,9 +188,8 @@ list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
 include(HandleLLVMOptions)
 
-# SVF (Andersen points-to) is the memory-region partitioner, replacing sea-dsa.
-# It is a HARD, ungated dependency: DSAWrapper derives a sound disjoint region
-# partition from SVF's inclusion-based points-to via union-find.
+# SVF Andersen supplies both the fail-closed memory partition and indirect-call
+# targets for devirtualization, so it is a hard dependency of this build.
 set(SVF_HOME "/home/ubuntu/SVF" CACHE PATH "SVF source+build root")
 find_package(SVF REQUIRED CONFIG)
 # SVF's exported targets advertise build-tree include dirs that may not exist in

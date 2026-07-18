@@ -13,9 +13,8 @@ pipeline and the Python tooling. Highlights:
 **C++ / LLVM**
 - LLVM 22 compatibility via `include/smack/LlvmCompat.h` shim
 - 22 NewPM siblings of legacy passes (Tier A leaves through Tier D sinks)
-- `runSmackFullNewPM` composes the full NewPM pipeline; sea-dsa (still legacy
-  upstream) is wrapped via `DSAWrapperAnalysis` / `CompleteCallGraphAnalysis`
-  legacy-PM-as-MAM-analysis bridges
+- `runSmackFullNewPM` composes the full NewPM pipeline; `DSAWrapperAnalysis`
+  exposes the in-process SVF Andersen component partition to NewPM consumers
 - Build with `-DSMACK_NEW_PM=ON` to route `llvm2bpl` through NewPM (default off;
   legacy remains the production path while corpus equivalence stays under CI)
 - Default C++20 build, with C++17 compatibility kept under CI via
@@ -60,9 +59,8 @@ pipeline and the Python tooling. Highlights:
 **Architecture references**
 - `runSmackTierANewPM` / `runSmackFullNewPM` — NewPM pipeline composers in
   `lib/smack/SmackPipeline.cpp`
-- `DSAWrapperAnalysis::run` — Option 2 sea-dsa-wrap pattern in
-  `lib/smack/DSAWrapperAnalysis.cpp` (NewPM analysis holds `legacy::PassManager`
-  for the lifetime of the cached result)
+- `DSAWrapperAnalysis::run` — NewPM owner for the SVF-backed `DSAWrapper` in
+  `lib/smack/DSAWrapperAnalysis.cpp`
 - `smack_target_setup(target)` — DRY include + LlvmCompat helper in
   `CMakeLists.txt`
 

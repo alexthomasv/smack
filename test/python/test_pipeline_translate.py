@@ -26,8 +26,6 @@ def make_translate_args(**overrides):
         linked_bc_file="input.bc",
         bpl_file="output.bpl",
         warn="silent",
-        sea_dsa_mode="bu",
-        sea_dsa_type_aware=False,
         provenance_syms=False,
         diff_product_mode=None,
         entry_points=["main"],
@@ -43,14 +41,7 @@ def make_translate_args(**overrides):
         no_byte_access_inference=False,
         rewrite_bitwise_ops=False,
         no_memory_splitting=False,
-        memory_partitioner="sea-dsa",
-        memory_partition_oracle=None,
         memory_partition_report=None,
-        svf_wpa=None,
-        svf_extapi=None,
-        svf_mem_par=None,
-        svf_analysis=None,
-        svf_timeout=None,
         devirt_report=None,
         static_init_zero_memset_threshold=None,
         check=VProperty.NONE,
@@ -143,7 +134,7 @@ def test_memsafety_subproperty_replaces_unselected_with_true(tmp_path):
 # --- llvm_to_bpl command assembly ---
 
 
-def test_llvm_to_bpl_passes_memory_partition_options(monkeypatch):
+def test_llvm_to_bpl_uses_only_universal_memory_options(monkeypatch):
     captured = {}
 
     def fake_try_command(cmd, console):
@@ -158,10 +149,6 @@ def test_llvm_to_bpl_passes_memory_partition_options(monkeypatch):
 
     llvm_to_bpl(
         make_translate_args(
-            sea_dsa_mode="butd-cs",
-            sea_dsa_type_aware=True,
-            memory_partitioner="svf-refined",
-            memory_partition_oracle="oracle.json",
             memory_partition_report="partition.json",
             devirt_report="devirt.json",
         )
@@ -169,110 +156,7 @@ def test_llvm_to_bpl_passes_memory_partition_options(monkeypatch):
 
     assert captured["console"] is True
     cmd = captured["cmd"]
-    assert "-sea-dsa=butd-cs" in cmd
-    assert "-sea-dsa-type-aware" in cmd
-    assert cmd[cmd.index("-smack-memory-partitioner") + 1] == "svf-refined"
-    assert cmd[cmd.index("-smack-memory-partition-oracle") + 1] == "oracle.json"
     assert cmd[cmd.index("-smack-memory-partition-report") + 1] == "partition.json"
     assert cmd[cmd.index("-smack-devirt-report") + 1] == "devirt.json"
-
-
-def test_llvm_to_bpl_generates_svf_oracle_for_default_path(monkeypatch):
-    captured = []
-    temps = iter(["pre.ll", "generated-oracle.json"])
-
-    def fake_try_command(cmd, console):
-        captured.append((cmd, console))
-
-    monkeypatch.setattr(translate, "temporary_file", lambda prefix, ext, args: next(temps))
-    monkeypatch.setattr(translate, "try_command", fake_try_command)
-    monkeypatch.setattr(translate, "annotate_bpl", lambda args: None)
-    monkeypatch.setattr(translate, "memsafety_subproperty_selection", lambda args: None)
-    monkeypatch.setattr(translate, "replace_reach_error", lambda args: None)
-    monkeypatch.setattr(translate, "transform_bpl", lambda args: None)
-
-    llvm_to_bpl(
-        make_translate_args(
-            memory_partitioner="svf-refined",
-            svf_extapi="/svf/extapi.bc",
-            svf_wpa="/svf/wpa",
-            svf_mem_par="intra-disjoint",
-            svf_timeout=12,
-        )
-    )
-
-    assert len(captured) == 3
-    pre_cmd, adapter_cmd, final_cmd = (entry[0] for entry in captured)
-    assert "-ll" in pre_cmd
-    assert pre_cmd[pre_cmd.index("-ll") + 1] == "pre.ll"
-    assert "-bpl" not in pre_cmd
-    assert pre_cmd[pre_cmd.index("-smack-memory-partitioner") + 1] == "sea-dsa"
-    assert "-smack-skip-devirt" in pre_cmd
-    assert adapter_cmd[:2] == [
-        translate.sys.executable,
-        str(translate._repo_root() / "tools" / "svf_memory_partition_adapter.py"),
-    ]
-    assert adapter_cmd[adapter_cmd.index("--bc") + 1] == "pre.ll"
-    assert adapter_cmd[adapter_cmd.index("--out") + 1] == "generated-oracle.json"
-    assert adapter_cmd[adapter_cmd.index("--svf-wpa") + 1] == "/svf/wpa"
-    assert adapter_cmd[adapter_cmd.index("--svf-extapi") + 1] == "/svf/extapi.bc"
-    assert adapter_cmd[adapter_cmd.index("--timeout") + 1] == "12"
-    assert "--indirect-call-targets" in adapter_cmd
-    assert final_cmd[final_cmd.index("-smack-memory-partitioner") + 1] == "svf-refined"
-    assert (
-        final_cmd[final_cmd.index("-smack-memory-partition-oracle") + 1]
-        == "generated-oracle.json"
-    )
-
-
-def test_llvm_to_bpl_skips_svf_oracle_when_memory_splitting_disabled(monkeypatch):
-    captured = []
-
-    def fake_try_command(cmd, console):
-        captured.append(cmd)
-
-    monkeypatch.setattr(translate, "try_command", fake_try_command)
-    monkeypatch.setattr(translate, "annotate_bpl", lambda args: None)
-    monkeypatch.setattr(translate, "memsafety_subproperty_selection", lambda args: None)
-    monkeypatch.setattr(translate, "replace_reach_error", lambda args: None)
-    monkeypatch.setattr(translate, "transform_bpl", lambda args: None)
-
-    llvm_to_bpl(
-        make_translate_args(memory_partitioner="svf-refined", no_memory_splitting=True)
-    )
-
-    assert len(captured) == 1
-    cmd = captured[0]
-    assert "-no-memory-splitting" in cmd
-    assert "-smack-memory-partition-oracle" not in cmd
-    assert cmd[cmd.index("-smack-memory-partitioner") + 1] == "svf-refined"
-
-
-def test_llvm_to_bpl_uses_inprocess_svf_native_without_oracle(monkeypatch):
-    captured = []
-
-    def fake_try_command(cmd, console):
-        captured.append(cmd)
-
-    monkeypatch.setattr(translate, "try_command", fake_try_command)
-    monkeypatch.setattr(translate, "annotate_bpl", lambda args: None)
-    monkeypatch.setattr(translate, "memsafety_subproperty_selection", lambda args: None)
-    monkeypatch.setattr(translate, "replace_reach_error", lambda args: None)
-    monkeypatch.setattr(translate, "transform_bpl", lambda args: None)
-
-    llvm_to_bpl(
-        make_translate_args(
-            memory_partitioner="svf-native",
-            svf_analysis="ander",
-            svf_mem_par="inter-disjoint",
-            svf_extapi="/svf/extapi.bc",
-        )
-    )
-
-    assert len(captured) == 1
-    cmd = captured[0]
-    assert "-smack-memory-partition-oracle" not in cmd
-    assert cmd[cmd.index("-smack-memory-partitioner") + 1] == "svf-native"
-    assert cmd[cmd.index("-smack-svf-analysis") + 1] == "ander"
-    assert cmd[cmd.index("-smack-svf-mem-par") + 1] == "inter-disjoint"
-    assert cmd[cmd.index("-smack-svf-extapi") + 1] == "/svf/extapi.bc"
+    retired = ("sea-dsa", "memory-partitioner", "partition-oracle", "smack-svf")
+    assert all(not any(marker in arg for marker in retired) for arg in cmd)

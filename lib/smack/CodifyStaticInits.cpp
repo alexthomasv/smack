@@ -176,6 +176,5 @@ char smack::CodifyStaticInits::ID = 0;
 using namespace smack;
 INITIALIZE_PASS_BEGIN(CodifyStaticInits, "codify-static-inits",
                       "Codify Static Initializers", false, false)
-INITIALIZE_PASS_DEPENDENCY(DSAWrapper)
 INITIALIZE_PASS_END(CodifyStaticInits, "codify-static-inits",
                     "Codify Static Initializers", false, false)

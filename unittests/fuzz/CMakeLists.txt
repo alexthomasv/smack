@@ -23,7 +23,6 @@ function(smack_add_fuzzer name source)
   smack_force_llvm_compat(${name})
   target_include_directories(${name} PRIVATE
     ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/sea-dsa/include
   )
   target_compile_options(${name} PRIVATE ${SMACK_FUZZ_FLAGS})
   target_link_options(${name} PRIVATE ${SMACK_FUZZ_FLAGS})

@@ -4,8 +4,11 @@
 #include "smack/SmackOptions.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/ErrorHandling.h"
 
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <tuple>
 
@@ -1118,22 +1121,29 @@ void MemDeclGen::generateMemoryMaps(std::stringstream &s) const {
                " regions)",
            s);
 
-  // Constant-global-only regions (-smack-const-regions) are declared `const`
-  // and fixed by axioms (see generateConstRegionAxioms); everything else is a
-  // mutable `var` map. memoryMaps() is index-aligned with the region table.
-  unsigned region = 0;
-  for (auto M : prelude.rep.memoryMaps()) {
-    bool isConst = prelude.rep.isConstRegion(region);
-    s << (isConst ? "const " : "var ") << M.first << ": " << M.second << ";"
-      << "\n";
-    ++region;
-  }
+  for (auto M : prelude.rep.memoryMaps())
+    s << "var " << M.first << ": " << M.second << ";\n";
 
   s << "\n";
 }
 
 void MemDeclGen::generateAddrBoundsAndPred(std::stringstream &s) const {
   describe("Memory address bounds", s);
+
+  const unsigned pointerBits = prelude.rep.ptrSizeInBits;
+  if (pointerBits != 32 && pointerBits != 64)
+    llvm::report_fatal_error(
+        "SMACK address bounds support only 32- or 64-bit pointers");
+  const __int128 addressMin =
+      pointerBits == 32 ? std::numeric_limits<int32_t>::min()
+                        : std::numeric_limits<long long>::min();
+  const __int128 externalBottom =
+      static_cast<__int128>(prelude.rep.globalsOffset) +
+      static_cast<__int128>(prelude.rep.externsOffset);
+  if (externalBottom < addressMin)
+    llvm::report_fatal_error(
+        "SMACK global and external address layout exceeds the target pointer "
+        "range");
 
   // e.g., axiom ($GLOBALS_BOTTOM == $sub.ref(0, 45419));
   s << Decl::axiom(Expr::eq(Expr::id(Naming::GLOBALS_BOTTOM),
@@ -1155,9 +1165,8 @@ void MemDeclGen::generateAddrBoundsAndPred(std::stringstream &s) const {
                             prelude.rep.pointerLit(malloc_top)))
     << "\n";
 
-  // $isExternal predicate:
-  // function {:inline} $isExternal(p: ref) returns (bool)
-  // {$slt.ref.bool(p,$EXTERNS_BOTTOM)}
+  // External-address predicate used for pointer results of unknown external
+  // procedures.
   s << Decl::function(
            Naming::EXTERNAL_ADDR, makePtrVars(1), Naming::BOOL_TYPE,
            Expr::fn(indexedName("$slt", {Naming::PTR_TYPE, Naming::BOOL_TYPE}),
@@ -1175,7 +1184,9 @@ void MemDeclGen::generateGlobalAllocations(std::stringstream &s) const {
     for (auto E : prelude.rep.globalAllocations)
       stmts.push_back(
           Stmt::call("$galloc", {prelude.rep.expr(E.first),
-                                 prelude.rep.pointerLit(E.second)}));
+                                 prelude.rep.pointerLit(
+                                     static_cast<unsigned long long>(
+                                         E.second))}));
     s << Decl::procedure("$global_allocations", {}, {}, {},
                          {Block::block("", stmts)})
       << "\n";

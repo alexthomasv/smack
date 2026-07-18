@@ -62,9 +62,10 @@ private:
   };
   std::map<const llvm::Value *, ProvenanceInfo> provenance;
 
-  // Cache of source file lines by filename.
+  // Cache of source file lines by debug-info directory and filename.
   std::map<std::string, std::vector<std::string>> sourceLineCache;
-  std::string getSourceLine(const std::string &filename, unsigned line);
+  std::string getSourceLine(const std::string &directory,
+                            const std::string &filename, unsigned line);
 
   Block *createBlock();
   Block *getBlock(llvm::BasicBlock *bb);
