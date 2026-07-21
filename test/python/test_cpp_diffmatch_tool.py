@@ -1,21 +1,24 @@
-import importlib.util
 import json
+import re
+import shutil
 import subprocess
-import sys
 
-from smack_test_paths import REPO_ROOT, clang_path, llvm_link_path, run_with_timeout, tool_path
+from smack_test_paths import REPO_ROOT, run_with_timeout, tool_path
 
 
-def load_svf_adapter_module():
-    module_path = REPO_ROOT / "tools" / "svf_memory_partition_adapter.py"
-    spec = importlib.util.spec_from_file_location("svf_memory_partition_adapter", module_path)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
+def matching_llvm_tool(name):
+    version = subprocess.run(
+        [tool_path("llvm-diffmatch2bpl"), "--version"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    ).stdout
+    match = re.search(r"LLVM version (\d+)", version)
+    assert match, version
+    path = shutil.which(f"{name}-{match.group(1)}")
+    assert path, f"{name} for {version.strip()} not found"
+    return path
 
 def compile_c_to_bc(tmp_path, name, source):
     src = tmp_path / f"{name}.c"
@@ -23,7 +26,7 @@ def compile_c_to_bc(tmp_path, name, source):
     src.write_text(source)
     run_with_timeout(
         [
-            clang_path(),
+            matching_llvm_tool("clang"),
             "-c",
             "-emit-llvm",
             "-O0",
@@ -50,7 +53,7 @@ def compile_support_lib_to_bc(tmp_path, lib_name):
     bc = tmp_path / f"{lib_name}.bc"
     run_with_timeout(
         [
-            clang_path(),
+            matching_llvm_tool("clang"),
             "-c",
             "-emit-llvm",
             "-O0",
@@ -87,7 +90,7 @@ def link_with_smack_support(tmp_path, name, bc):
         compile_support_lib_to_bc(tmp_path, "smack-rust.c"),
     ]
     run_with_timeout(
-        [llvm_link_path(), "-o", str(linked), str(bc), *map(str, support)],
+        [matching_llvm_tool("llvm-link"), "-o", str(linked), str(bc), *map(str, support)],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -98,74 +101,22 @@ def link_with_smack_support(tmp_path, name, bc):
     return linked
 
 
-def build_empty_svf_oracle(tmp_path, name, linked, *, sea_dsa_mode="ci"):
-    adapter = load_svf_adapter_module()
-    pre_ll = tmp_path / f"{name}.pre.ll"
-    oracle_path = tmp_path / f"{name}.oracle.json"
-    completed = run_with_timeout(
-        [
-            tool_path("llvm2bpl"),
-            str(linked),
-            f"-sea-dsa={sea_dsa_mode}",
-            "-smack-memory-partitioner=sea-dsa",
-            f"--ll={pre_ll}",
-            "-warn-type",
-            "silent",
-            "-source-loc-syms",
-            "-provenance-syms",
-            "-entry-points",
-            "f",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-        timeout_name="SMACK_TOOL",
-        default_timeout=120,
-    )
-    assert completed.returncode == 0, completed.stdout
-    oracle = adapter.build_oracle(ll_text=pre_ll.read_text(), svf_output="")
-    oracle_path.write_text(json.dumps(oracle, indent=2, sort_keys=True) + "\n")
-    return oracle
-
-
-def write_bundled_oracle(tmp_path, left_linked, right_linked):
-    left_oracle = build_empty_svf_oracle(tmp_path, "left", left_linked)
-    right_oracle = build_empty_svf_oracle(tmp_path, "right", right_linked)
-    modules = {
-        left_oracle["module_fingerprint"]: left_oracle,
-        right_oracle["module_fingerprint"]: right_oracle,
-    }
-    bundle = {
-        "schema_version": 2,
-        "producer": "svf-memory-partition-bundle",
-        "analysis": "andersen",
-        "memory_partition": "intra-disjoint",
-        "modules": modules,
-        "stats": {"module_count": len(modules)},
-    }
-    bundle_path = tmp_path / "svf-memory-partition-bundle.json"
-    bundle_path.write_text(json.dumps(bundle, indent=2, sort_keys=True) + "\n")
-    return bundle_path
-
-
-def run_diffmatch(tmp_path, extra_args=None):
+def run_diffmatch(tmp_path, extra_args=None, *, left_source=None, right_source=None):
     left_bc = compile_c_to_bc(
         tmp_path,
         "left",
-        "int f(int x) {\n  int y = x + 0;\n  return y + 1;\n}\n",
+        left_source or "int f(int x) {\n  int y = x + 0;\n  return y + 1;\n}\n",
     )
     right_bc = compile_c_to_bc(
         tmp_path,
         "right",
-        "int f(int x) {\n  int y = x - 0;\n  return y + 1;\n}\n",
+        right_source or "int f(int x) {\n  int y = x - 0;\n  return y + 1;\n}\n",
     )
     left_linked = link_with_smack_support(tmp_path, "left", left_bc)
     right_linked = link_with_smack_support(tmp_path, "right", right_bc)
     left_bpl = tmp_path / "left.bpl"
     right_bpl = tmp_path / "right.bpl"
     match_json = tmp_path / "match.json"
-    oracle = write_bundled_oracle(tmp_path, left_linked, right_linked)
     cmd = [
         tool_path("llvm-diffmatch2bpl"),
         "--left-bc",
@@ -184,8 +135,6 @@ def run_diffmatch(tmp_path, extra_args=None):
         str(match_json),
         "-warn-type",
         "silent",
-        "-sea-dsa=ci",
-        f"-smack-memory-partition-oracle={oracle}",
         "-source-loc-syms",
         "-provenance-syms",
         "-entry-points",
@@ -238,3 +187,15 @@ def test_cpp_diffmatch2bpl_dumps_ll_only_when_requested(tmp_path):
 
     assert "define" in (tmp_path / "left.ll").read_text()
     assert "define" in (tmp_path / "right.ll").read_text()
+
+
+def test_cpp_diffmatch2bpl_models_indirect_calls_conservatively_on_both_sides(tmp_path):
+    source = "int f(int (*p)(int), int x) { return p(x); }\n"
+    left_bpl, right_bpl, _ = run_diffmatch(
+        tmp_path, left_source=source, right_source=source
+    )
+
+    for bpl in (left_bpl.read_text(), right_bpl.read_text()):
+        assert "$unresolved.indirect.i32" in bpl
+        assert "{:unresolved_indirect}" in bpl
+        assert "modifies $M.0;" in bpl

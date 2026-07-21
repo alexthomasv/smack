@@ -7,14 +7,12 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Rewrites each indirect call `(*fp)(args)` whose targets SVF resolves
-// COMPLETELY into a direct dispatch over those targets (a "bounce" function),
-// so SMACK's translator -- which cannot emit a genuine indirect call -- can
-// handle function-pointer / vtable code. The target set comes from SVF's
-// Andersen call graph (`getIndCSCallees`); the rewrite only fires when SVF
-// proves the function pointer points *only* to known functions (its points-to
-// set excludes the black-hole), which is exactly what makes the bounce's
-// `unreachable` no-match branch sound. Unresolvable callsites are left as-is.
+// Rewrites each indirect call `(*fp)(args)` into a direct dispatch over its
+// possible targets (a "bounce" function), so known targets become precise
+// direct calls. Every bounce retains the original indirect call as its no-match
+// branch. The translator models that residual as unknown-callee havoc, so an
+// incomplete SVF/FLTA target set can never remove a runtime behavior.
+// Callsites with no candidates at all are left as-is (unknown-callee model).
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,11 +26,8 @@
 #include "smack/InitializePasses.h"
 #include "smack/Debug.h"
 #include "smack/LlvmCompat.h"
-#include "smack/Naming.h"
-#include "smack/SmackOptions.h"
 
 #include "llvm/ADT/Statistic.h"
-#include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/CommandLine.h"
@@ -41,9 +36,8 @@
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 
-// SVF: the (sound) source of indirect-call targets. Reused from the analysis
+// SVF supplies the over-approximated indirect-call targets. Reuse the analysis
 // DSAWrapper builds once; see DSAWrapper::cachedSVF.
-#include "Graphs/CallGraph.h"
 #include "Graphs/ICFGNode.h"
 #include "MemoryModel/PointsTo.h"
 #include "SVF-LLVM/LLVMModule.h"
@@ -61,9 +55,6 @@ using namespace llvm;
 // Pass statistics
 STATISTIC(FuncAdded, "Number of bounce functions added");
 STATISTIC(CSConvert, "Number of call sites converted");
-STATISTIC(DeadFnStubbed,
-          "Number of unreachable functions with unresolved indirect calls "
-          "stubbed with `unreachable`");
 
 static cl::opt<std::string> DevirtReportFilename(
     "smack-devirt-report",
@@ -74,15 +65,16 @@ static cl::opt<std::string> DevirtReportFilename(
 // method slot to also include signature-INCOMPATIBLE functions (e.g. a 3-arg RSA
 // fn appears as a candidate for a 2-arg hash-method slot). A well-typed indirect
 // call can never reach such a target -- calling through a signature-incompatible
-// fp is UB -- so it is an SVF false positive. Dropping it (and bodyless/unmapped
-// targets, which cannot execute here) keeps the bounce's else-`assume false`
-// sound while resolving far more sites. This is what LLVM whole-program devirt
-// does. Pass -devirt-strict-types to restore the old "decline the whole site on
-// any incompatible/unmapped target" behavior (the safety valve).
+// fp is UB -- so it is an SVF false positive. Dropping it keeps the direct
+// branches precise; the residual indirect branch still covers every unmatched
+// runtime target. UNMAPPED targets (no module function of that name) are not
+// filtered: that is a name-mapping failure, not UB evidence, so the whole site
+// is declined regardless of this flag. Pass -devirt-strict-types to also decline
+// the whole site on any signature-incompatible target (the safety valve).
 static cl::opt<bool> DevirtStrictTypes(
     "devirt-strict-types",
-    cl::desc("Decline a devirt site if ANY SVF target is signature-incompatible "
-             "or unmapped, instead of type-filtering it (default: filter)."),
+    cl::desc("Decline a devirt site if ANY SVF target is signature-incompatible, "
+             "instead of type-filtering it (default: filter)."),
     cl::init(false));
 
 //===----------------------------------------------------------------------===//
@@ -131,9 +123,22 @@ static inline Value *castTo(Value *V, Type *Ty, std::string Name,
     llvm_unreachable("Unexpected insertion point.");
 }
 
-static inline bool isZExtOrBitCastable(Value *V, Type *T) {
-  return CastInst::castIsValid(Instruction::ZExt, V->getType(), T) ||
-         CastInst::castIsValid(Instruction::BitCast, V->getType(), T);
+static bool hasAbiParameterAttributes(const AttributeList &attributes,
+                                      unsigned argumentCount) {
+  static constexpr Attribute::AttrKind abiKinds[] = {
+      Attribute::InReg,        Attribute::Nest,
+      Attribute::SExt,         Attribute::ZExt,
+      Attribute::SwiftAsync,   Attribute::SwiftError,
+      Attribute::SwiftSelf,    Attribute::ByRef,
+      Attribute::ByVal,        Attribute::ElementType,
+      Attribute::ImmArg,       Attribute::InAlloca,
+      Attribute::NoExt,        Attribute::Preallocated,
+      Attribute::StructRet};
+  for (unsigned argument = 0; argument < argumentCount; ++argument)
+    for (Attribute::AttrKind kind : abiKinds)
+      if (attributes.hasParamAttr(argument, kind))
+        return true;
+  return false;
 }
 
 // Pick a valid DebugLoc for a devirt-created call replacing `orig`: reuse orig's
@@ -155,46 +160,94 @@ static DebugLoc devirtCallLoc(const Instruction *orig) {
 // not be dispatched -- such a target forces us to leave the callsite untouched
 // (see resolveSVFTargets) rather than silently drop a possible runtime target.
 //
-static inline bool match(CallBase *CS, const Function &F) {
+static inline bool hasCompatibleCallShape(CallBase *CS, const Function &F) {
   auto N = CS->arg_size();
   auto T = F.getFunctionType();
   auto M = T->getNumParams();
   auto RT = T->getReturnType();
   auto IT = CS->getType();
 
-  if (RT != IT && !CastInst::isBitCastable(RT, IT))
+  const auto *calledPointer =
+      dyn_cast<PointerType>(CS->getCalledOperand()->getType());
+  if (!calledPointer || calledPointer->getAddressSpace() != 0 ||
+      F.getAddressSpace() != 0 || RT != IT ||
+      CS->getCallingConv() != F.getCallingConv() || N < M ||
+      (N > M && !F.isVarArg()))
     return false;
 
-  if (N < M)
-    return false;
-
-  if (N > M && !F.isVarArg())
-    return false;
-
-  for (unsigned i = 0; i < M; i++) {
-    auto A = CS->getArgOperand(i);
-    auto PT = T->getParamType(i);
-    if (A->getType() != PT && !isZExtOrBitCastable(A, PT))
+  for (unsigned i = 0; i < M; i++)
+    if (CS->getArgOperand(i)->getType() != T->getParamType(i))
       return false;
-  }
 
   return true;
 }
 
-static inline bool checkArgs(const CallBase *CS, const Function *F) {
+static bool containsCallerSensitiveIntrinsic(const Function &F) {
+  if (F.isDeclaration())
+    return false;
+  for (const Instruction &I : instructions(F)) {
+    const auto *CB = dyn_cast<CallBase>(&I);
+    const Function *callee = CB ? CB->getCalledFunction() : nullptr;
+    if (!callee || !callee->isIntrinsic())
+      continue;
+    const StringRef name = callee->getName();
+    if (name.starts_with("llvm.returnaddress") ||
+        name.starts_with("llvm.frameaddress") ||
+        name.starts_with("llvm.addressofreturnaddress"))
+      return true;
+  }
+  return false;
+}
+
+// A helper frame is itself observable for these features. A residual indirect
+// edge cannot repair that semantic change: the unsupported target would still
+// execute inside the helper. One such possible target therefore declines the
+// entire callsite rather than merely being filtered from the direct branches.
+static std::string unsupportedTargetRewrite(CallBase *CS, const Function &F) {
+  if (!hasCompatibleCallShape(CS, F))
+    return "";
+  if (F.hasFnAttribute(Attribute::ReturnsTwice))
+    return "unsupported-target:returns-twice:" + F.getName().str();
+  if (F.hasFnAttribute(Attribute::StrictFP))
+    return "unsupported-target:strictfp:" + F.getName().str();
+  if (F.isConvergent())
+    return "unsupported-target:convergent:" + F.getName().str();
+  if (F.hasFnAttribute(Attribute::NoDuplicate))
+    return "unsupported-target:noduplicate:" + F.getName().str();
+  if (containsCallerSensitiveIntrinsic(F))
+    return "unsupported-target:caller-sensitive:" + F.getName().str();
+  return "";
+}
+
+static inline bool match(CallBase *CS, const Function &F) {
   auto N = CS->arg_size();
-  auto T = F->getFunctionType();
+  auto T = F.getFunctionType();
   auto M = T->getNumParams();
 
-  if (N + 1 != M)
+  // A bounce is an ordinary internal function. Restrict rewrites to the exact
+  // ABI subset it preserves; dropping non-ABI semantic attributes only adds
+  // behaviors, while the residual indirect edge handles every excluded
+  // callsite without dropping a possible execution.
+  if (!hasCompatibleCallShape(CS, F) || CS->getNumOperandBundles() != 0 ||
+      hasAbiParameterAttributes(CS->getAttributes(), N) ||
+      hasAbiParameterAttributes(F.getAttributes(), M) || CS->isConvergent() ||
+      F.isConvergent() || CS->hasFnAttr(Attribute::NoDuplicate) ||
+      F.hasFnAttribute(Attribute::NoDuplicate) ||
+      CS->hasFnAttr(Attribute::StackAlignment) ||
+      F.hasFnAttribute(Attribute::StackAlignment) ||
+      CS->getAttributes().hasRetAttr(Attribute::InReg) ||
+      CS->getAttributes().hasRetAttr(Attribute::NoExt) ||
+      CS->getAttributes().hasRetAttr(Attribute::SExt) ||
+      CS->getAttributes().hasRetAttr(Attribute::ZExt) ||
+      F.getAttributes().hasRetAttr(Attribute::InReg) ||
+      F.getAttributes().hasRetAttr(Attribute::NoExt) ||
+      F.getAttributes().hasRetAttr(Attribute::SExt) ||
+      F.getAttributes().hasRetAttr(Attribute::ZExt))
     return false;
-
-  for (unsigned i = 0; i < N; i++) {
-    auto A = CS->getArgOperand(i);
-    auto PT = T->getParamType(i + 1);
-    if (A->getType() != PT && !isZExtOrBitCastable(A, PT))
+  if (const auto *CI = dyn_cast<CallInst>(CS))
+    if (CI->isMustTailCall())
       return false;
-  }
+
   return true;
 }
 
@@ -214,41 +267,31 @@ sortedTargets(const std::set<const Function *> &targets) {
 }
 
 //===----------------------------------------------------------------------===//
-// SVF target resolution + soundness completeness gate.
+// SVF target resolution.
 //===----------------------------------------------------------------------===//
 
 namespace {
 
-struct SvfResolution {
-  // True only when SVF resolved EVERY possible target (no black-hole) and each
-  // maps to a signature-compatible llvm::Function -- the precondition for a
-  // sound `unreachable` no-match branch. Devirt fires iff this is true.
-  bool complete = false;
-  std::vector<const Function *> targets;
-  std::string reason; // diagnostic: why complete / why not
-};
-
 //
 // Resolve the targets of indirect call CS from SVF's Andersen call graph.
 //
-// Soundness: we devirtualize ONLY when the resolution is complete, i.e. SVF
-// proves the function pointer points only to known functions. The gate is:
+// The bounded-target gate is:
 //   (1) SVF has resolved callees for this site (hasIndCSCallees), AND
 //   (2) the function pointer's points-to set excludes the black-hole (SVF's
 //       "points to some unknown object" marker), AND
 //   (3) every resolved callee maps to a signature-compatible llvm::Function.
-// If any callee cannot be mapped or matched, we BAIL (mark incomplete) rather
-// than drop a possible target -- dropping one would make the bounce's
-// `unreachable` reachable at runtime, which is unsound.
+// If the gate fails, FLTA may still provide direct-target precision. The
+// residual indirect edge always covers omitted runtime targets.
 //
-SvfResolution resolveSVFTargets(CallBase *CS) {
-  SvfResolution R;
+DevirtResolution resolveAndersenTargets(CallBase *CS) {
+  DevirtResolution R;
   Module &M = *CS->getModule();
 
   SVF::LLVMModuleSet *ms = nullptr;
   SVF::SVFIR *pag = nullptr;
   SVF::Andersen *ander = nullptr;
-  if (!smack::DSAWrapper::cachedSVF(ms, pag, ander) || !ms || !pag || !ander) {
+  if (!smack::DSAWrapper::cachedSVF(M, ms, pag, ander) || !ms || !pag ||
+      !ander) {
     R.reason = "svf-unavailable";
     return R;
   }
@@ -264,10 +307,7 @@ SvfResolution resolveSVFTargets(CallBase *CS) {
     return R;
   }
 
-  // Completeness gate (the crux): the function pointer must point only to known
-  // objects. If its points-to set contains the black-hole, SVF could not bound
-  // the target set, so the `unreachable` fallback would be unsound -> leave the
-  // call untouched.
+  // A black-hole means Andersen did not bound the target set; use FLTA instead.
   const SVF::SVFVar *funPtr = cnode->getIndFunPtr();
   if (!funPtr) {
     R.reason = "no-fun-ptr";
@@ -289,14 +329,21 @@ SvfResolution resolveSVFTargets(CallBase *CS) {
     const std::string &name = fo->getName();
     Function *F = M.getFunction(name);
     if (!F) {
-      if (DevirtStrictTypes) {
-        R.reason = "target-unmapped:" + name;
-        return R;
-      }
-      continue; // bodyless/unmapped over-approx target: cannot execute here.
+      // An SVF target with no corresponding module function is a NAME-MAPPING
+      // failure (e.g. an extapi-internal symbol), not evidence the target
+      // cannot execute. Decline this Andersen set and let FLTA/residual
+      // handling preserve the callsite.
+      R.reason = "target-unmapped:" + name;
+      return R;
     }
     if (isIgnoredTarget(*F))
       continue;
+    if (std::string unsupported = unsupportedTargetRewrite(CS, *F);
+        !unsupported.empty()) {
+      R.rewriteSafe = false;
+      R.reason = std::move(unsupported);
+      return R;
+    }
     if (!match(CS, *F)) {
       if (DevirtStrictTypes) {
         R.reason = "target-type-mismatch:" + name;
@@ -318,6 +365,73 @@ SvfResolution resolveSVFTargets(CallBase *CS) {
   return R;
 }
 
+//
+// Resolution entry point: Andersen first; when Andersen cannot bound the
+// targets, fall back to function-level type analysis (FLTA): every
+// address-taken function the callsite could legally invoke (the same match()
+// signature filter that already justifies type-filtering -- calling through an
+// incompatible fp is UB). FLTA target sets are small in practice (only
+// address-taken functions qualify), and the resulting bounce keeps a residual
+// indirect call as its no-match branch, so FLTA is sound even if a real target
+// somehow escaped the enumeration: the residual is translated as an
+// unknown-callee havoc.
+//
+DevirtResolution resolveSVFTargets(CallBase *CS, bool allowFlta) {
+  DevirtResolution R;
+  if (isa<InvokeInst>(CS)) {
+    R.rewriteSafe = false;
+    R.reason = "unsupported-callsite:invoke";
+    return R;
+  }
+  if (CS->hasFnAttr(Attribute::ReturnsTwice)) {
+    R.rewriteSafe = false;
+    R.reason = "unsupported-callsite:returns-twice";
+    return R;
+  }
+  if (CS->hasFnAttr(Attribute::StrictFP) ||
+      CS->getFunction()->hasFnAttribute(Attribute::StrictFP)) {
+    R.rewriteSafe = false;
+    R.reason = "unsupported-callsite:strictfp";
+    return R;
+  }
+  if (CS->getFunction()->hasGC()) {
+    R.rewriteSafe = false;
+    R.reason = "unsupported-callsite:gc";
+    return R;
+  }
+
+  R = resolveAndersenTargets(CS);
+  if (!R.rewriteSafe || R.complete || !allowFlta)
+    return R;
+
+  Module &M = *CS->getModule();
+  std::set<const Function *> flta;
+  for (Function &F : M) {
+    if (F.isIntrinsic() || !F.hasAddressTaken())
+      continue;
+    if (F.getName().starts_with("devirtbounce") ||
+        F.hasFnAttribute("smack.devirt.bounce") || isIgnoredTarget(F))
+      continue; // never dispatch into our own bounces / SMACK intrinsics
+    if (std::string unsupported = unsupportedTargetRewrite(CS, F);
+        !unsupported.empty()) {
+      R.targets.clear();
+      R.flta = false;
+      R.rewriteSafe = false;
+      R.reason = std::move(unsupported);
+      return R;
+    }
+    if (!match(CS, F))
+      continue;
+    flta.insert(&F);
+  }
+  if (!flta.empty()) {
+    R.targets = sortedTargets(flta);
+    R.flta = true;
+    R.reason = "flta:" + std::to_string(flta.size()) + "(" + R.reason + ")";
+  }
+  return R;
+}
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -335,6 +449,7 @@ struct DevirtReportEntry {
   unsigned column = 0;
   std::string instruction;
   bool complete = false;
+  bool flta = false;
   unsigned targetCount = 0;
   std::string reason;
   std::vector<std::string> targets;
@@ -380,7 +495,7 @@ void addDebugLoc(DevirtReportEntry &entry, const CallBase &CS) {
 }
 
 void recordDevirtResolution(const CallBase &CS,
-                            const SvfResolution &resolution) {
+                            const DevirtResolution &resolution) {
   if (DevirtReportFilename.empty())
     return;
 
@@ -393,6 +508,7 @@ void recordDevirtResolution(const CallBase &CS,
   entry.function = CS.getParent()->getParent()->getName().str();
   entry.instruction = valueToString(CS);
   entry.complete = resolution.complete;
+  entry.flta = resolution.flta;
   entry.targetCount = resolution.targets.size();
   entry.reason = resolution.reason;
   addDebugLoc(entry, CS);
@@ -432,6 +548,7 @@ void writeDevirtReport(const Module &M) {
           J.attribute("column", entry.column);
           J.attribute("instruction", entry.instruction);
           J.attribute("complete", entry.complete);
+          J.attribute("flta", entry.flta);
           J.attribute("target_count", entry.targetCount);
           J.attribute("reason", entry.reason);
           J.attributeArray("targets", [&] {
@@ -456,8 +573,9 @@ void writeDevirtReport(const Module &M) {
 //
 // Description:
 //  Builds a bounce function that compares the incoming function pointer to each
-//  target and, on a match, performs the direct call; on no match it executes
-//  `unreachable` (sound because the caller only devirtualizes COMPLETE sites).
+//  target and, on a match, performs the direct call. The no-match branch always
+//  executes the residual indirect call. The translator models it as an
+//  unknown-callee havoc, so a target omitted by SVF/FLTA is over-approximated.
 //
 Function *Devirtualize::buildBounce(CallBase *CS,
                                     std::vector<const Function *> &Targets) {
@@ -476,24 +594,13 @@ Function *Devirtualize::buildBounce(CallBase *CS,
   Module *M = CS->getParent()->getParent()->getParent();
   Function *F =
       Function::Create(NewTy, GlobalValue::InternalLinkage, "devirtbounce", M);
+  F->setCallingConv(CS->getCallingConv());
 
-  // Synthetic DISubprogram for the bounce so its dispatch calls can carry a !dbg
-  // location -- the inliner requires one to anchor the inlined debug info of the
-  // (debug-info-bearing) real callees, else LLVM's verifier rejects the module
-  // once the bounce is inlined. `bounceLoc` stays empty when the module has no
-  // debug info (then F has no subprogram and no !dbg is needed).
+  // Bounces are synthetic and intentionally carry no DISubprogram. Pre-BPL
+  // cleanup can leave caller debug scopes without a retained compile unit;
+  // manufacturing a definition-scoped DISubprogram from such metadata creates
+  // invalid IR. An empty location is valid for these dead-last dispatch calls.
   DebugLoc bounceLoc;
-  if (DISubprogram *callerSP = CS->getFunction()->getSubprogram()) {
-    DIBuilder DIB(*M);
-    DISubprogram *SP = DIB.createFunction(
-        callerSP->getUnit(), F->getName(), F->getName(), callerSP->getFile(),
-        /*LineNo=*/0, DIB.createSubroutineType(DIB.getOrCreateTypeArray({})),
-        /*ScopeLine=*/0, DINode::FlagArtificial,
-        DISubprogram::SPFlagDefinition | DISubprogram::SPFlagLocalToUnit);
-    F->setSubprogram(SP);
-    DIB.finalizeSubprogram(SP);
-    bounceLoc = DILocation::get(M->getContext(), 0, 0, SP);
-  }
 
   // Set the names of the arguments.
   F->arg_begin()->setName("funcPtr");
@@ -521,9 +628,16 @@ Function *Devirtualize::buildBounce(CallBase *CS,
         TE = FT->param_end();
          P != PE && T != TE; ++P, ++T)
       Args.push_back(castTo(&*P, *T, "", BL));
+    // A vararg target consumes the remaining callsite arguments unchanged.
+    // Dropping the variadic tail would silently alter the call's semantics —
+    // an argument the callee reads would vanish from the model.
+    if (FL->isVarArg())
+      for (; P != PE; ++P)
+        Args.push_back(&*P);
 
     CallInst *directCall =
         CallInst::Create(const_cast<Function *>(FL), Args, "", BL);
+    directCall->setCallingConv(FL->getCallingConv());
     directCall->setDebugLoc(bounceLoc);
 
     // Add the return instruction for the basic block.
@@ -533,13 +647,21 @@ Function *Devirtualize::buildBounce(CallBase *CS,
       ReturnInst::Create(M->getContext(), directCall, BL);
   }
 
-  // Create a failure basic block ending in `unreachable`.
+  // The no-match block performs the residual indirect call through the incoming
+  // function pointer. Translation turns it into unknown-callee havoc.
   BasicBlock *failBB = BasicBlock::Create(M->getContext(), "fail", F);
 
-  if (Targets.size())
-    new UnreachableInst(M->getContext(), failBB);
-  else
+  std::vector<Value *> Args;
+  for (auto A = std::next(F->arg_begin()), E = F->arg_end(); A != E; ++A)
+    Args.push_back(&*A);
+  CallInst *residual = CallInst::Create(CS->getFunctionType(),
+                                        &*F->arg_begin(), Args, "", failBB);
+  residual->setCallingConv(CS->getCallingConv());
+  residual->setDebugLoc(bounceLoc);
+  if (CS->getType()->isVoidTy())
     ReturnInst::Create(M->getContext(), failBB);
+  else
+    ReturnInst::Create(M->getContext(), residual, failBB);
 
   // Entry block initially branches to the failure block; rewired below.
   BranchInst *InsertPt = BranchInst::Create(failBB, entryBB);
@@ -574,26 +696,34 @@ Function *Devirtualize::buildBounce(CallBase *CS,
 //
 const Function *Devirtualize::findInCache(const CallBase *CS,
                                           std::set<const Function *> &Targets) {
-  std::map<const Function *, std::set<const Function *>>::iterator I;
-  for (I = bounceCache.begin(); I != bounceCache.end(); ++I) {
+  for (auto I = bounceCache.begin(); I != bounceCache.end(); ++I) {
     const Function *bounceFunc = I->first;
 
     // Check the return type.
     if (CS->getType() != bounceFunc->getReturnType())
       continue;
 
-    // Check the type of the function pointer and the arguments.
-    PointerType *PT = dyn_cast<PointerType>(bounceFunc->arg_begin()->getType());
-    assert(PT);
-    if (CS->getCalledOperand()->stripPointerCastsAndAliases()->getType() != PT)
+    // The bounce's signature is (funcPtr, <original callsite arg types...>).
+    // Under opaque pointers a pointer-type check no longer discriminates, so
+    // require the callsite's arity and argument types to match the bounce's
+    // parameters exactly — mismatched reuse would mint an out-of-bounds
+    // getParamType / ill-typed dispatch call. (Non-vararg targets force equal
+    // arity via match(), but an all-vararg target set can be reached from
+    // callsites of different shapes.)
+    FunctionType *BT = bounceFunc->getFunctionType();
+    if (BT->getNumParams() != CS->arg_size() + 1)
       continue;
-
-    FunctionType *FT = CS->getFunctionType();
-    if (FT->isVarArg() && !checkArgs(CS, bounceFunc))
+    bool argsMatch = true;
+    for (unsigned i = 0, n = CS->arg_size(); i < n; ++i)
+      if (CS->getArgOperand(i)->getType() != BT->getParamType(i + 1)) {
+        argsMatch = false;
+        break;
+      }
+    if (!argsMatch)
       continue;
 
     // Determine whether the targets are identical.
-    if (Targets == I->second)
+    if (Targets == I->second.targets)
       return I->first;
   }
 
@@ -603,25 +733,31 @@ const Function *Devirtualize::findInCache(const CallBase *CS,
 //
 // Method: makeDirectCall()
 //
-// Transforms the specified indirect call site into a direct call, IF SVF
-// resolves it completely; otherwise leaves it untouched.
+// Transforms an indirect call when Andersen or FLTA supplies direct targets.
 //
-void Devirtualize::makeDirectCall(CallBase *CS) {
-  SvfResolution resolution = resolveSVFTargets(CS);
-  recordDevirtResolution(*CS, resolution);
+void Devirtualize::makeDirectCall(CallBase *CS,
+                                  const DevirtResolution &resolution) {
+  // A helper call cannot preserve InvokeInst's unwind edge or CallBrInst's
+  // indirect destinations. Only ordinary calls enter the bounce rewrite.
+  if (!isa<CallInst>(CS))
+    return;
 
-  // Soundness gate: only devirtualize completely-resolved call sites, so the
-  // bounce's `unreachable` no-match branch is genuinely infeasible.
-  if (!resolution.complete || resolution.targets.empty())
+  // Without any candidate, leave the original indirect call for unknown-callee
+  // translation.
+  if (!resolution.rewriteSafe ||
+      (!(resolution.complete || resolution.flta) ||
+       resolution.targets.empty()))
     return;
 
   std::vector<const Function *> Targets = resolution.targets;
   std::set<const Function *> targetSet(Targets.begin(), Targets.end());
+  // SVF/FLTA targets are precision hints, never an exhaustiveness authority.
+  // Every bounce keeps the residual indirect call on the no-match edge.
   const Function *NF = findInCache(CS, targetSet);
 
   if (!NF) {
     NF = buildBounce(CS, Targets);
-    bounceCache[NF] = targetSet;
+    bounceCache[NF] = {targetSet};
   }
 
   // Replace the original call with a call to the bounce function.
@@ -635,21 +771,9 @@ void Devirtualize::makeDirectCall(CallBase *CS) {
     }
 
     std::string name = CI->hasName() ? CI->getName().str() + ".dv" : "";
-    CallInst *CN = CallInst::Create(const_cast<Function *>(NF), Params, name, CI);
-    CN->setDebugLoc(devirtCallLoc(CI));
-    CI->replaceAllUsesWith(CN);
-    CI->eraseFromParent();
-  } else if (InvokeInst *CI = dyn_cast<InvokeInst>(CS)) {
-    std::vector<Value *> Params;
-    Params.push_back(CI->getCalledOperand());
-    for (unsigned i = 0; i < CI->arg_size(); i++)
-      Params.push_back(castTo(CI->getArgOperand(i),
-                              NF->getFunctionType()->getParamType(i + 1), "",
-                              CS));
-    std::string name = CI->hasName() ? CI->getName().str() + ".dv" : "";
-    InvokeInst *CN =
-        InvokeInst::Create(const_cast<Function *>(NF), CI->getNormalDest(),
-                           CI->getUnwindDest(), Params, name, CI);
+    CallInst *CN =
+        CallInst::Create(const_cast<Function *>(NF), Params, name, CI);
+    CN->setCallingConv(CI->getCallingConv());
     CN->setDebugLoc(devirtCallLoc(CI));
     CI->replaceAllUsesWith(CN);
     CI->eraseFromParent();
@@ -657,136 +781,62 @@ void Devirtualize::makeDirectCall(CallBase *CS) {
 
   // Update the statistics on the number of transformed call sites.
   ++CSConvert;
+  Changed = true;
 }
 
 //
 // Method: processCallSite()
 //
 // If CS is an indirect call, queue it for transformation. Whether it is
-// actually devirtualized is decided in makeDirectCall (completeness gate).
+// actually devirtualized is decided in makeDirectCall (target availability).
 //
 void Devirtualize::processCallSite(CallBase *CS) {
-  if (!CS->isIndirectCall())
+  if (!CS->isIndirectCall() ||
+      (!isa<CallInst>(CS) && !isa<InvokeInst>(CS)))
     return;
 
-  DevirtCallsiteIndices[CS] = Worklist.size();
+  // A prior early-devirtualization run already modeled these residual calls.
+  // Processing them again only nests equivalent bounces indefinitely.
+  const Function *caller = CS->getFunction();
+  if (caller->getName().starts_with("devirtbounce") ||
+      caller->hasFnAttribute("smack.devirt.bounce"))
+    return;
+
+  DevirtCallsiteIndices[CS] = indirectCallsiteIndex(*CS);
   Worklist.push_back(CS);
-}
-
-//
-// Stub functions that are UNREACHABLE in SVF's (sound) call graph but still
-// contain an indirect call devirt could not resolve. Such a call would crash
-// SmackInstGenerator (`cast<Function>` on a non-Function callee), yet the
-// function is provably never called (no caller, and not a resolved target of
-// any indirect call) — so its body is dead and replacing it with `unreachable`
-// is sound. This is points-to-informed dead-code elimination: LLVM's globaldce
-// conservatively keeps such functions because they are address-taken (e.g. a
-// vtable constant lists them), but SVF proves no call edge actually reaches
-// them. Example: BearSSL's `br_gcm_aad_inject` is listed in `br_gcm_vtable` but
-// never dispatched, so its `ctx` param has empty points-to and `ctx->gh`
-// resolves to nothing.
-//
-static void stubUnreachableIndirectCallFunctions(Module &M) {
-  SVF::LLVMModuleSet *ms = nullptr;
-  SVF::SVFIR *pag = nullptr;
-  SVF::Andersen *ander = nullptr;
-  if (!smack::DSAWrapper::cachedSVF(ms, pag, ander) || !ander)
-    return;
-  SVF::CallGraph *cg = ander->getCallGraph();
-  if (!cg)
-    return;
-
-  // name -> call-graph node (one pass over the graph).
-  std::map<std::string, const SVF::CallGraphNode *> byName;
-  for (const auto &item : *cg)
-    byName[item.second->getName()] = item.second;
-
-  // Roots = the functions SMACK keeps live (same predicate as its internalize
-  // pass): entry points, smack-internal names, and the assume intrinsic.
-  std::set<const SVF::CallGraphNode *> reachable;
-  std::vector<const SVF::CallGraphNode *> work;
-  auto visit_root = [&](const SVF::CallGraphNode *n) {
-    if (n && reachable.insert(n).second)
-      work.push_back(n);
-  };
-  for (Function &F : M) {
-    if (F.isDeclaration())
-      continue;
-    StringRef nm = F.getName();
-    if (smack::SmackOptions::isEntryPoint(nm) || smack::Naming::isSmackName(nm) ||
-        nm.contains("__VERIFIER_assume")) {
-      auto it = byName.find(nm.str());
-      if (it != byName.end())
-        visit_root(it->second);
-    }
-  }
-  // BFS over call edges (direct + SVF-resolved indirect) -> reachable set.
-  while (!work.empty()) {
-    const SVF::CallGraphNode *n = work.back();
-    work.pop_back();
-    for (const SVF::CallGraphEdge *e : n->getOutEdges())
-      visit_root(e->getDstNode());
-  }
-
-  for (Function &F : M) {
-    if (F.isDeclaration() || F.empty())
-      continue;
-    auto it = byName.find(F.getName().str());
-    if (it == byName.end())
-      continue; // not modeled by SVF -> conservatively leave it
-    if (reachable.count(it->second))
-      continue; // reachable from a root -> live
-    bool hasIndirect = false;
-    for (Instruction &I : instructions(F))
-      if (auto *CB = dyn_cast<CallBase>(&I))
-        if (CB->isIndirectCall()) {
-          hasIndirect = true;
-          break;
-        }
-    if (!hasIndirect)
-      continue; // dead but harmless -> leave for normal DCE
-
-    // Replace the body with a single `unreachable` (preserve linkage so any
-    // vtable constant referencing the function stays valid).
-    auto linkage = F.getLinkage();
-    for (BasicBlock &BB : F)
-      BB.dropAllReferences();
-    while (!F.empty())
-      F.begin()->eraseFromParent();
-    BasicBlock *bb = BasicBlock::Create(F.getContext(), "", &F);
-    new UnreachableInst(F.getContext(), bb);
-    F.setLinkage(linkage);
-    ++DeadFnStubbed;
-  }
 }
 
 //
 // Method: runOnModule()
 //
-// Entry point: find indirect calls and turn the completely-resolved ones into
-// direct calls.
+// Entry point: turn resolvable indirect calls into direct-target dispatches
+// with a residual indirect fallback.
 //
 bool Devirtualize::runOnModule(Module &M) {
   Worklist.clear();
+  bounceCache.clear();
   DevirtCallsiteIndices.clear();
+  Changed = false;
   if (!DevirtReportFilename.empty())
     DevirtReportEntries.clear();
 
   TD = &M.getDataLayout();
 
-  // Collect indirect call sites, then transform.
+  // The residual no-match edge makes both Andersen and FLTA target lists safe
+  // precision hints, so every remaining callsite may use FLTA.
   visit(M);
+  std::vector<DevirtResolution> resolutions;
+  resolutions.reserve(Worklist.size());
+  for (CallBase *CS : Worklist) {
+    resolutions.push_back(resolveSVFTargets(CS, true));
+    recordDevirtResolution(*CS, resolutions.back());
+  }
   for (unsigned index = 0; index < Worklist.size(); ++index)
-    makeDirectCall(Worklist[index]);
-
-  // Neutralize unreachable functions whose unresolved indirect calls would
-  // otherwise crash translation (points-to-informed dead-code elimination).
-  stubUnreachableIndirectCallFunctions(M);
+    makeDirectCall(Worklist[index], resolutions[index]);
 
   writeDevirtReport(M);
 
-  // Conservatively assume we've changed one or more call sites.
-  return true;
+  return Changed;
 }
 
 void Devirtualize::getAnalysisUsage(AnalysisUsage &AU) const {
@@ -802,10 +852,13 @@ char Devirtualize::ID = 0;
 llvm::PreservedAnalyses
 DevirtualizeNewPM::run(Module &M, ModuleAnalysisManager &MAM) {
   // Ensure SVF is built (DSAWrapperAnalysis caches it) before devirt resolves.
+  // Building that result may normalize M in place on its first run. Invalidate
+  // every other cached analysis even when no bounce was emitted; preserving
+  // them would expose pre-normalization facts to the remaining pipeline.
   MAM.getResult<smack::DSAWrapperAnalysis>(M);
   Devirtualize pass;
-  bool changed = pass.runOnModule(M);
-  return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  pass.runOnModule(M);
+  return PreservedAnalyses::none();
 }
 
 using namespace smack;

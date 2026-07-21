@@ -169,6 +169,10 @@ int main(int argc, char **argv) {
   smack::SmackPipelineOptions options;
   options.staticUnroll = StaticUnroll;
   options.modular = Modular;
+  // SVF owns process-global state and cannot soundly analyze the right module
+  // after analyzing the left. Keep both sides symmetric and conservative:
+  // unresolved indirect calls lower to a havocing external-call model.
+  options.skipDevirtualization = true;
   options.defaultDataLayout = DefaultDataLayout;
   // Force-link SmackOptions so llvm-diffmatch2bpl exposes the same low-level
   // flags as llvm2bpl.
@@ -186,6 +190,10 @@ int main(int argc, char **argv) {
   smack::SmackBplOptions bplOptions;
   bplOptions.structuredLoops = StructuredBplLoops || StructuredBplLoopsStrict;
   bplOptions.structuredLoopsStrict = StructuredBplLoopsStrict;
+  // The two independent modules share one process, while SVF owns
+  // process-global state. Use the universal map on both sides; reusing side
+  // one's points-to graph for side two would be unsound.
+  bplOptions.forceUniversalMemory = true;
   writeBpl(*leftModule, LeftBpl, bplOptions);
   writeBpl(*rightModule, RightBpl, bplOptions);
 

@@ -140,22 +140,16 @@ def run_product_with_interpreter(product_text, tmp_path, name, inputs):
     program_inputs = ProgramInputs(
         {var: Input(name=var, private=False, value=value) for var, value in inputs.items()}
     )
-    try:
-        return run_native(
-            parse_boogie(text),
-            program_inputs,
-            test_name=name,
-            input_name=name,
-            raw_log_path=tmp_path / f"{name}.trace.raw.zst",
-            no_trace=True,
-            log_read=False,
-            return_status=True,
-            return_scalar_summary=True,
-        )
-    except RuntimeError as exc:
-        if "return_scalar_summary" in str(exc):
-            pytest.skip(str(exc))
-        raise
+    return run_native(
+        parse_boogie(text),
+        program_inputs,
+        input_name=name,
+        raw_log_path=tmp_path / f"{name}.trace.raw.zst",
+        no_trace=True,
+        log_read=False,
+        return_status=True,
+        return_scalar_summary=True,
+    )
 
 
 def source_diff(name, left, right):

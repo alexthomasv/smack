@@ -23,12 +23,19 @@ struct SmackMemoryPartitionReport;
 struct SmackPipelineOptions {
   bool staticUnroll = false;
   bool modular = false;
+  // Some tools lower multiple independent modules in one process. SVF cannot
+  // safely rebuild there, so they preserve soundness by leaving indirect calls
+  // unresolved for the conservative Boogie fallback.
+  bool skipDevirtualization = false;
   std::string defaultDataLayout;
 };
 
 struct SmackBplOptions {
   bool structuredLoops = false;
   bool structuredLoopsStrict = false;
+  // Multi-module tools cannot reuse SVF's process-global analysis for another
+  // module. Route every access through one map instead.
+  bool forceUniversalMemory = false;
   SmackMemoryPartitionReport *memoryPartitionReport = nullptr;
 };
 
@@ -47,6 +54,13 @@ struct SmackMemoryPartitionReport {
     unsigned modRegionCount = 0;
     std::string fallbackReason;
   };
+  struct SVFRegionAuthority {
+    unsigned region = 0;
+    bool noAliasSeed = false;
+    bool stackAllocation = false;
+    bool heapAllocation = false;
+    bool globalAllocation = false;
+  };
 
   std::string partitioner;
   std::string dsaMode;
@@ -54,6 +68,26 @@ struct SmackMemoryPartitionReport {
   unsigned memoryAccessCount = 0;
   unsigned mergeCount = 0;
   unsigned lateRegionCount = 0;
+  bool svfUniversalRegion = false;
+  unsigned svfUnresolvedAccessCount = 0;
+  unsigned svfUnknownTargetAccessCount = 0;
+  unsigned svfUnsupportedPointerOriginCount = 0;
+  unsigned svfScannedFunctionCount = 0;
+  unsigned svfReachableFunctionCount = 0;
+  bool svfIrSnapshotMatch = true;
+  unsigned svfNoAliasSeedCount = 0;
+  bool svfClosedInputContract = false;
+  bool svfAllocatorModel = false;
+  unsigned svfNoAliasSeededRegionCount = 0;
+  unsigned svfStackRegionCount = 0;
+  unsigned svfHeapRegionCount = 0;
+  unsigned svfGlobalRegionCount = 0;
+  unsigned svfMixedAuthorityRegionCount = 0;
+  std::vector<SVFRegionAuthority> svfRegionAuthorities;
+  bool svfFieldWindows = false;
+  unsigned svfOffsetKnownCount = 0;
+  unsigned windowedRegionCount = 0;
+  unsigned splitComponentCount = 0;
   unsigned singletonCount = 0;
   unsigned allocatedCount = 0;
   unsigned bytewiseCount = 0;
@@ -126,8 +160,8 @@ void runSmackTierANewPM(llvm::Module &module,
                         const SmackPipelineOptions &options);
 
 // Full NewPM pipeline: Tier A + B + C + D siblings composed into a single
-// ModulePassManager via PassBuilder. Tier C/D analyses bridge the SVF-backed
-// DSAWrapper via DSAWrapperAnalysis / RegionsAnalysis / SmackModuleGeneratorAnalysis.
+// ModulePassManager via PassBuilder. DSAWrapperAnalysis supplies SVF to
+// devirtualization and component-only memory partitioning.
 // Emits Boogie to `out`. Gated by -DSMACK_NEW_PM=ON in tools/llvm2bpl/llvm2bpl.cpp.
 void runSmackFullNewPM(llvm::Module &module, llvm::raw_ostream &out,
                        const SmackPipelineOptions &options,

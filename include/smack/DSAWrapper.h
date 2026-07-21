@@ -7,14 +7,19 @@
 //
 //   region(p) = the union-find component containing every object in pts(p).
 //
-// Two pointers placed in DISTINCT regions therefore have disjoint points-to
-// sets and are PROVABLY non-aliasing — exactly the invariant the split-memory
-// model needs to stay sound. (sea-dsa got disjointness natively from its
-// unification model; SVF is inclusion-based, so we derive it via union-find.)
+// Two pointers placed in DISTINCT regions are non-aliasing by one of two
+// authorities: disjoint SVF allocation components, or the verification
+// contract that `noalias` pointer parameters on a selected entry point denote
+// separately allocated, externally owned top-level buffers. The latter is
+// deliberately stronger than LLVM's generic access-based `noalias` semantics;
+// it is the closed-input assumption selected by SMACK harnesses such as
+// canonical AEAD. Stack-allocation separation additionally requires SMACK's
+// concrete allocator declarations and initialization procedure to be present.
 //
 #ifndef DSAWRAPPER_H
 #define DSAWRAPPER_H
 
+#include <limits>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,8 +36,10 @@ class LLVMModuleSet;
 namespace smack {
 
 // Opaque handle to a disjoint memory region. Distinct non-null refs are
-// PROVABLY non-aliasing. nullptr means "no region" (e.g. undef / null pointer /
-// a pointer SVF could not resolve to any object).
+// non-aliasing by SVF points-to disjointness. Before a universal collapse,
+// nullptr means SVF supplied no concrete component for the pointer. After a
+// collapse every translated pointer, including null and undef, receives the
+// universal region handle.
 using MemNodeRef = const void *;
 
 class DSAWrapper : public llvm::ModulePass {
@@ -47,7 +54,20 @@ private:
   // Union-find over SVF object NodeIDs.
   std::map<unsigned, unsigned> ufParent;
   unsigned ufFind(unsigned x);
-  void ufUnite(unsigned a, unsigned b);
+  bool ufUnite(unsigned a, unsigned b);
+
+  // Synthetic allocation objects for explicitly disjoint top-level buffers.
+  // Pointer equality is propagated from each entry argument through derived
+  // values and call edges; propagation only merges components.
+  std::unordered_map<const llvm::Value *, unsigned> explicitRoots;
+  std::unordered_set<unsigned> syntheticObjects;
+  std::unordered_set<unsigned> noAliasSeedObjects;
+  std::unordered_set<unsigned> constantDataObjects;
+  unsigned nextSyntheticRoot = std::numeric_limits<unsigned>::max() - 1;
+  unsigned noAliasSeedCount = 0;
+  const llvm::Function *contractEntry = nullptr;
+  bool closedInputContractActive = false;
+  bool allocatorModelActive = false;
 
   // Per-component (region) aggregate properties, keyed by component root.
   struct RegionInfo {
@@ -57,28 +77,37 @@ private:
     bool arrayLike = false;   // contains an array object
     bool staticInitd = false; // contains a global with an initializer
     bool memOpd = false;      // is a memcpy/memset operand
+    bool noAliasSeeded = false; // contains an explicit entry-buffer seed
+    bool stackAllocation = false;
+    bool heapAllocation = false;
+    bool globalAllocation = false;
     unsigned numGlobals = 0;  // number of distinct global objects merged in
   };
   std::unordered_map<unsigned, RegionInfo> regionInfo; // root -> info
   std::unordered_set<unsigned> memOpdObjs;             // objs used by memcpy/memset
 
-  // Cache: pointer Value -> component root + 1 (0 == no region).
-  std::unordered_map<const llvm::Value *, unsigned> valueRootPlus1;
-
-  // Reachable (LIVE) functions: BFS over the call graph (direct + SVF-resolved
-  // indirect edges) from the entry roots. Mem-ops in UNREACHABLE functions never
-  // execute, so their pointers cannot cause a runtime alias.
+  // Closed program rooted at the selected SMACK entry points and initialization
+  // procedures. This is reported as audit metadata; the partition proof itself
+  // checks every emitted definition because Regions translates the whole module.
   std::unordered_set<const llvm::Function *> reachableFuncs;
   void computeReachable(llvm::Module &M);
 
-  // SOUND catch-all. Set when a LIVE mem-op pointer is unresolved (SVF gave it no
-  // region). Such a pointer may alias ANY object, so the split-memory invariant
+  // Cache: pointer Value -> component root + 1 (0 == no region).
+  std::unordered_map<const llvm::Value *, unsigned> valueRootPlus1;
+
+  // SOUND catch-all. Set when any translated mem-op pointer is unresolved (SVF
+  // gave it no concrete region). Such a pointer may alias ANY object, so the
+  // global split-memory invariant
   // (may-alias => same region) can only be kept by placing everything in one
   // region. When set, rootPlus1 returns the single universal region for every
-  // pointer. This is the only sound treatment of a live unresolved pointer; the
-  // R1/R2/R3 precise resolvers exist to keep this from triggering where possible.
+  // pointer. This is the only sound treatment of an unresolved access.
   bool collapsed = false;
+  bool irSnapshotMatch = true;
   unsigned collapsedRoot = 0;
+  unsigned unresolvedAccessCount = 0;
+  unsigned unknownTargetAccessCount = 0;
+  unsigned unsupportedPointerOriginCount = 0;
+  unsigned scannedFunctionCount = 0;
 
   void buildUnionFind(llvm::Module &M);
   void aggregateRegions();
@@ -102,19 +131,16 @@ public:
 
   // Pointer queries.
   MemNodeRef getNode(const llvm::Value *v);
-  unsigned getOffset(const llvm::Value *v);
   unsigned getPointedTypeSize(const llvm::Value *v);
   bool isRead(const llvm::Value *v);
   bool isTypeSafe(const llvm::Value *v);
 
   // Access the process-global SVF analysis (module set / SVFIR / Andersen)
   // that runOnModule builds once and reuses. Returns false if SVF has not been
-  // built yet (DSAWrapper has not run). The SVF-based devirtualizer uses this to
-  // reuse the same pre-devirt points-to information — it MUST run after
-  // DSAWrapper (enforced via AnalysisUsage), so by the time it calls this the
-  // handles are populated.
-  static bool cachedSVF(SVF::LLVMModuleSet *&ms, SVF::SVFIR *&pag,
-                        SVF::Andersen *&ander);
+  // built yet or its exact IR snapshot no longer matches. The SVF-based
+  // devirtualizer uses this only after DSAWrapper (enforced via AnalysisUsage).
+  static bool cachedSVF(const llvm::Module &M, SVF::LLVMModuleSet *&ms,
+                        SVF::SVFIR *&pag, SVF::Andersen *&ander);
 
   // Region (node) queries.
   unsigned getNumGlobals(MemNodeRef n);
@@ -124,7 +150,26 @@ public:
   bool isComplicated(MemNodeRef n);
   bool isIncomplete(MemNodeRef n);
   bool isArray(MemNodeRef n);
-  bool isCollapsed(MemNodeRef n);
+  bool hasNoAliasSeed(MemNodeRef n);
+  bool hasStackAllocation(MemNodeRef n);
+  bool hasHeapAllocation(MemNodeRef n);
+  bool hasGlobalAllocation(MemNodeRef n);
+  bool usedUniversalRegion() const { return collapsed; }
+  unsigned getUnresolvedAccessCount() const { return unresolvedAccessCount; }
+  unsigned getUnknownTargetAccessCount() const {
+    return unknownTargetAccessCount;
+  }
+  unsigned getUnsupportedPointerOriginCount() const {
+    return unsupportedPointerOriginCount;
+  }
+  unsigned getScannedFunctionCount() const { return scannedFunctionCount; }
+  unsigned getReachableFunctionCount() const {
+    return static_cast<unsigned>(reachableFuncs.size());
+  }
+  bool matchedIrSnapshot() const { return irSnapshotMatch; }
+  unsigned getNoAliasSeedCount() const { return noAliasSeedCount; }
+  bool usedClosedInputContract() const { return closedInputContractActive; }
+  bool usedAllocatorModel() const { return allocatorModelActive; }
 };
 } // namespace smack
 

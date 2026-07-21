@@ -759,12 +759,9 @@ void SmackModuleGenerator::generateProgramImpl(
     // ... added below, after body generation has discovered late maps too.
   }
 
-  // MODIFIES: every procedure conservatively modifies all memory maps. (The
-  // SVF/oracle path previously narrowed this per-function; with sea-dsa removed
-  // we restore the sound default — Boogie procedures must declare every region
-  // they may touch, and SMACK inlines into entry points so the over-approx is
-  // harmless.) Build the region list once after instruction generation has
-  // discovered all regions.
+  // MODIFIES: every procedure conservatively modifies every memory map.
+  // Boogie procedures must declare every map they may touch; over-approximating
+  // a frame is sound.
   std::list<std::string> allMemoryMaps;
   for (const auto &memoryMap : rep.memoryMaps())
     allMemoryMaps.push_back(memoryMap.first);
@@ -774,6 +771,16 @@ void SmackModuleGenerator::generateProgramImpl(
     for (auto *proc : entry.second)
       for (const auto &mod : allMemoryMaps)
         proc->getModifies().push_back(mod);
+  }
+
+  // Unknown-callee procedures (indirect calls devirt could not resolve) get
+  // the same conservative modifies-all as external declarations: the unknown
+  // function may write any region. Declared here, after body generation, so
+  // the memory-map list is complete.
+  for (auto *proc : rep.unknownIndirectCallProcs()) {
+    for (const auto &mod : allMemoryMaps)
+      proc->getModifies().push_back(mod);
+    decls.insert(decls.end(), proc);
   }
 
   auto ds = rep.auxiliaryDeclarations();

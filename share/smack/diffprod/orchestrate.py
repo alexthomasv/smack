@@ -21,7 +21,6 @@ from smack.pipeline.frontend import frontend, target_selection
 from smack.pipeline.transform import transform_bpl, transform_out
 from smack.pipeline.translate import (
     annotate_bpl,
-    generate_svf_memory_partition_oracle,
     memsafety_subproperty_selection,
     replace_reach_error,
 )
@@ -182,15 +181,6 @@ def run_paired_diff_product_lowering(args, left_args, right_args, tmp_dir):
     """Run the paired SMACK LLVM matcher/lowerer when it is available."""
 
     match_file = str(Path(tmp_dir) / "llvm-match.json")
-    oracle_file = getattr(args, "memory_partition_oracle", None)
-    if (
-        args.memory_partitioner == "svf-refined"
-        and not oracle_file
-        and not args.no_memory_splitting
-    ):
-        oracle_file = generate_paired_svf_memory_partition_oracle(
-            args, left_args, right_args, tmp_dir
-        )
     cmd = [
         "llvm-diffmatch2bpl",
         "--left-bc",
@@ -218,7 +208,6 @@ def run_paired_diff_product_lowering(args, left_args, right_args, tmp_dir):
     cmd += llvm_to_bpl_option_args(
         args,
         [args.diff_left_entry, args.diff_right_entry],
-        memory_partition_oracle=oracle_file,
     )
 
     if args.debug:
@@ -274,64 +263,10 @@ def run_paired_diff_product_lowering(args, left_args, right_args, tmp_dir):
     }
 
 
-def generate_paired_svf_memory_partition_oracle(args, left_args, right_args, tmp_dir):
-    """Generate and bundle per-side SVF oracles for paired lowering."""
-
-    entry_points = []
-    for ep in (args.diff_left_entry, args.diff_right_entry):
-        if ep and ep not in entry_points:
-            entry_points.append(ep)
-
-    left_oracle_args = copy.copy(left_args)
-    right_oracle_args = copy.copy(right_args)
-    left_oracle_args.entry_points = entry_points
-    right_oracle_args.entry_points = entry_points
-    for name in (
-        "svf_wpa",
-        "svf_extapi",
-        "svf_mem_par",
-        "svf_timeout",
-        "svf_indirect_calls",
-        "svf_loop_diagnostics",
-        "svf_saber_diagnostics",
-        "svf_mta_diagnostics",
-    ):
-        if hasattr(args, name):
-            setattr(left_oracle_args, name, getattr(args, name))
-            setattr(right_oracle_args, name, getattr(args, name))
-
-    left_oracle_path = Path(generate_svf_memory_partition_oracle(left_oracle_args))
-    right_oracle_path = Path(generate_svf_memory_partition_oracle(right_oracle_args))
-    left_oracle = json.loads(left_oracle_path.read_text())
-    right_oracle = json.loads(right_oracle_path.read_text())
-
-    modules = {
-        left_oracle["module_fingerprint"]: left_oracle,
-        right_oracle["module_fingerprint"]: right_oracle,
-    }
-    bundle = {
-        "schema_version": 2,
-        "producer": "svf-memory-partition-bundle",
-        "analysis": left_oracle.get("analysis", "andersen"),
-        "memory_partition": left_oracle.get("memory_partition", "intra-disjoint"),
-        "modules": modules,
-        "stats": {
-            "module_count": len(modules),
-            "left_module_fingerprint": left_oracle["module_fingerprint"],
-            "right_module_fingerprint": right_oracle["module_fingerprint"],
-        },
-    }
-
-    bundle_path = Path(tmp_dir) / "svf-memory-partition-bundle.json"
-    bundle_path.write_text(json.dumps(bundle, indent=2, sort_keys=True) + "\n")
-    return str(bundle_path)
-
-
-def llvm_to_bpl_option_args(args, entry_points, memory_partition_oracle=None):
+def llvm_to_bpl_option_args(args, entry_points):
     """Build the llvm2bpl-compatible options shared by product lowerers."""
 
     cmd = ["-warn-type", args.warn]
-    cmd += ["-sea-dsa=bu"]
     if sys.stdout.isatty():
         cmd += ["-colored-warnings"]
     cmd += ["-source-loc-syms"]
@@ -365,22 +300,6 @@ def llvm_to_bpl_option_args(args, entry_points, memory_partition_oracle=None):
         cmd += ["-rewrite-bitwise-ops"]
     if args.no_memory_splitting:
         cmd += ["-no-memory-splitting"]
-    cmd += ["-smack-memory-partitioner", args.memory_partitioner]
-    oracle = memory_partition_oracle or getattr(args, "memory_partition_oracle", None)
-    if oracle:
-        cmd += ["-smack-memory-partition-oracle", oracle]
-    if getattr(args, "svf_loop_frames", False):
-        cmd += ["-smack-svf-loop-frames"]
-    if getattr(args, "svf_call_frames", False):
-        cmd += ["-smack-svf-call-frames"]
-    if getattr(args, "svf_indirect_calls", False):
-        cmd += ["-smack-svf-indirect-calls"]
-    if getattr(args, "svf_analysis", None):
-        cmd += ["-smack-svf-analysis", str(args.svf_analysis)]
-    if getattr(args, "svf_mem_par", None):
-        cmd += ["-smack-svf-mem-par", str(args.svf_mem_par)]
-    if getattr(args, "svf_extapi", None):
-        cmd += ["-smack-svf-extapi", str(args.svf_extapi)]
     if args.static_init_zero_memset_threshold is not None:
         cmd += [
             "-static-init-zero-memset-threshold",

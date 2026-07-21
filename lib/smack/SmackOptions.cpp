@@ -66,7 +66,8 @@ const llvm::cl::opt<bool> SmackOptions::RewriteBitwiseOps(
 
 const llvm::cl::opt<bool> SmackOptions::NoMemoryRegionSplitting(
     "no-memory-splitting",
-    llvm::cl::desc("Disable splitting memory into regions."));
+    llvm::cl::desc("Disable SVF splitting and use one universal memory map."),
+    llvm::cl::init(false));
 
 const llvm::cl::opt<bool> SmackOptions::SkipDevirt(
     "smack-skip-devirt",
@@ -75,7 +76,7 @@ const llvm::cl::opt<bool> SmackOptions::SkipDevirt(
 
 const llvm::cl::opt<bool> SmackOptions::NoByteAccessInference(
     "no-byte-access-inference",
-    llvm::cl::desc("Optimize bit-precision with DSA."));
+    llvm::cl::desc("Force bytewise memory maps in bit-precise mode."));
 
 const llvm::cl::opt<bool> SmackOptions::FloatEnabled(
     "float", llvm::cl::desc("Enable interpreted floating-point type"));

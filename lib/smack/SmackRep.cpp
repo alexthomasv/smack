@@ -21,6 +21,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <list>
+#include <limits>
 #include <queue>
 #include <set>
 
@@ -286,15 +287,18 @@ std::string SmackRep::type(const llvm::Type *t) {
 
 std::string SmackRep::type(const llvm::Value *v) { return type(v->getType()); }
 
-unsigned SmackRep::storageSize(llvm::Type *T) {
-  return fixedTypeStoreSize(*targetData, T);
+uint64_t SmackRep::storageSize(llvm::Type *T) {
+  // GEP strides, alloca extents, and global object placement use allocation
+  // size (including ABI tail padding), not merely the bytes occupied by the
+  // stored value.
+  return fixedTypeAllocSize(*targetData, T);
 }
 
-unsigned SmackRep::offset(llvm::ArrayType *T, unsigned idx) {
+uint64_t SmackRep::offset(llvm::ArrayType *T, unsigned idx) {
   return storageSize(T->getElementType()) * idx;
 }
 
-unsigned SmackRep::offset(llvm::StructType *T, unsigned idx) {
+uint64_t SmackRep::offset(llvm::StructType *T, unsigned idx) {
   return targetData->getStructLayout(T)->getElementOffset(idx);
 }
 
@@ -336,7 +340,9 @@ bool SmackRep::isExternal(const llvm::Value *v) {
 
 const Stmt *SmackRep::alloca(llvm::AllocaInst &i) {
   const Expr *size = Expr::fn(
-      "$mul.ref", pointerLit(storageSize(i.getAllocatedType())),
+      "$mul.ref",
+      pointerLit(static_cast<unsigned long long>(
+          storageSize(i.getAllocatedType()))),
       integerToPointer(expr(i.getArraySize()), getIntSize(i.getArraySize())));
 
   // TODO this should not be a pointer type.
@@ -344,17 +350,22 @@ const Stmt *SmackRep::alloca(llvm::AllocaInst &i) {
 }
 
 const Stmt *SmackRep::memcpy(const llvm::MemCpyInst &mci) {
-  unsigned length;
+  uint64_t length;
   if (auto CI = dyn_cast<ConstantInt>(mci.getLength()))
     length = CI->getZExtValue();
   else
-    length = std::numeric_limits<unsigned>::max();
+    length = Region::UNBOUNDED;
 
   unsigned r1 = regions->idx(mci.getRawDest(), length);
   unsigned r2 = regions->idx(mci.getRawSource(), length);
 
   const Type *T = regions->get(r1).getType();
-  Decl *P = memcpyProc(T ? type(T) : intType(8), length);
+  // memcpyProc's `unsigned` length keeps its historical 32-bit "unknown"
+  // sentinel; clamp larger (incl. UNBOUNDED) region lengths onto it.
+  unsigned procLen = length >= std::numeric_limits<unsigned>::max()
+                         ? std::numeric_limits<unsigned>::max()
+                         : static_cast<unsigned>(length);
+  Decl *P = memcpyProc(T ? type(T) : intType(8), procLen);
   auxDecls[P->getName()] = P;
 
   const Value *dst = mci.getRawDest(), *src = mci.getRawSource(),
@@ -369,16 +380,19 @@ const Stmt *SmackRep::memcpy(const llvm::MemCpyInst &mci) {
 }
 
 const Stmt *SmackRep::memset(const llvm::MemSetInst &msi) {
-  unsigned length;
+  uint64_t length;
   if (auto CI = dyn_cast<ConstantInt>(msi.getLength()))
     length = CI->getZExtValue();
   else
-    length = std::numeric_limits<unsigned>::max();
+    length = Region::UNBOUNDED;
 
   unsigned r = regions->idx(msi.getRawDest(), length);
 
   const Type *T = regions->get(r).getType();
-  Decl *P = memsetProc(T ? type(T) : intType(8), length);
+  unsigned procLen = length >= std::numeric_limits<unsigned>::max()
+                         ? std::numeric_limits<unsigned>::max()
+                         : static_cast<unsigned>(length);
+  Decl *P = memsetProc(T ? type(T) : intType(8), procLen);
   auxDecls[P->getName()] = P;
 
   const Value *dst = msi.getRawDest(), *val = msi.getValue(),
@@ -390,6 +404,49 @@ const Stmt *SmackRep::memset(const llvm::MemSetInst &msi) {
        integerToPointer(expr(len), len->getType()->getIntegerBitWidth()),
        Expr::lit(msi.isVolatile())},
       {memReg(r)});
+}
+
+// Model a call through a function pointer devirt/SVF could not resolve like a
+// call to a bodyless external declaration: the unknown callee may write any
+// memory region and returns an arbitrary value. SmackModuleGenerator appends
+// `modifies <every memory map>` to these procedures after translation (the
+// region set is only complete then) — the same conservative treatment external
+// declarations receive. This over-approximates the unknown callee; emitting
+// `assume false` here instead would under-approximate (delete real executions
+// at a reachable site) and could falsely verify.
+const Stmt *SmackRep::unknownIndirectCall(const llvm::CallBase &CB) {
+  const llvm::Type *T = CB.getType();
+  std::string name =
+      std::string("$unresolved.indirect.") +
+      (llvm::isa<llvm::InvokeInst>(CB) ? "invoke." : "") +
+      (T->isVoidTy() ? "void" : type(T));
+  if (!unknownCallProcs.count(name)) {
+    std::list<Binding> rets;
+    if (!T->isVoidTy())
+      rets.push_back({Naming::RET_VAR, type(T)});
+    ProcDecl *proc = Decl::procedure(name, {}, rets);
+    // An unresolved invoke may either return or unwind. Havocing the exception
+    // state lets its two LLVM successors remain feasible; fixing $exn to its
+    // incoming value would silently delete one behavior.
+    if (llvm::isa<llvm::InvokeInst>(CB)) {
+      proc->getModifies().push_back(Naming::EXN_VAR);
+      proc->getModifies().push_back(Naming::EXN_VAL_VAR);
+    }
+    unknownCallProcs[name] = proc;
+  }
+  std::list<std::string> callRets;
+  if (!T->isVoidTy())
+    callRets.push_back(naming->get(CB));
+  // The attribute keeps every such site grep-able in the .bpl (it marks the
+  // havoc-modeled unknown-callee calls, distinct from devirt-bounce assumes).
+  return Stmt::call(name, {}, callRets, {Attr::attr("unresolved_indirect")});
+}
+
+std::list<ProcDecl *> SmackRep::unknownIndirectCallProcs() {
+  std::list<ProcDecl *> procs;
+  for (auto &entry : unknownCallProcs)
+    procs.push_back(entry.second);
+  return procs;
 }
 
 const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
@@ -419,6 +476,8 @@ const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
         auto T = AI->getAllocatedType();
         const unsigned bits = this->getSize(T);
         const unsigned bytes = bits / 8;
+        // Annotation memory is routed through the same partition component as
+        // every translated load and store on this allocation.
         const unsigned R = regions->idx(AI);
         bool bytewise = regions->get(R).bytewiseAccess();
 
@@ -632,10 +691,15 @@ const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
       fatalUserError(CI, "__SMACK_values: second argument (count) must be a "
                          "constant integer");
 
-    const unsigned argCount = I->getZExtValue();
-    const unsigned singleObjSize = this->getSize(T) / 8;
-    const unsigned totalBytes = argCount * singleObjSize;
-    unsigned elementSize = 1;
+    if (I->getValue().getActiveBits() > 64)
+      fatalUserError(CI, "__SMACK_values: element count exceeds 64 bits");
+    const uint64_t argCount = I->getZExtValue();
+    const uint64_t singleObjSize = this->getSize(T) / 8;
+    if (singleObjSize != 0 &&
+        argCount > std::numeric_limits<uint64_t>::max() / singleObjSize)
+      fatalUserError(CI, "__SMACK_values: annotated byte range overflows");
+    const uint64_t totalBytes = argCount * singleObjSize;
+    uint64_t elementSize = 1;
 
     if (T->isArrayTy()) {
       elementSize = this->getSize(T->getArrayElementType()) / 8;
@@ -645,7 +709,10 @@ const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
 
     if (elementSize == 0)
       elementSize = 1;
-    const unsigned bits = elementSize * 8;
+    if (elementSize > std::numeric_limits<unsigned>::max() / 8)
+      fatalUserError(CI, "__SMACK_values: element width exceeds SMACK's "
+                         "integer type range");
+    const unsigned bits = static_cast<unsigned>(elementSize * 8);
 
     const unsigned R = regions->idx(V, totalBytes);
     bool bytewise = regions->get(R).bytewiseAccess();
@@ -656,8 +723,9 @@ const Stmt *SmackRep::valueAnnotation(const CallInst &CI) {
         "array",
         {Expr::lit(Naming::LOAD + "." + (bytewise ? "bytes." : "") +
                    intType(bits)),
-         Expr::id(memPath(R)), addr, Expr::lit(elementSize),
-         Expr::lit(totalBytes)}));
+         Expr::id(memPath(R)), addr,
+         Expr::lit(static_cast<unsigned long long>(elementSize)),
+         Expr::lit(static_cast<unsigned long long>(totalBytes))}));
   }
 
   return Stmt::call(name, args, rets, attrs);
@@ -791,19 +859,22 @@ const Stmt *SmackRep::store(unsigned R, const Type *T, const Expr *P,
   return Stmt::assign(M, singleton ? V : Expr::fn(N, M, P, V));
 }
 
-const Expr *SmackRep::pa(const Expr *base, long long idx, unsigned size) {
+const Expr *SmackRep::pa(const Expr *base, long long idx, uint64_t size) {
   if (idx >= 0) {
-    return pa(base, pointerLit(idx), pointerLit(size));
+    return pa(base, pointerLit(idx),
+              pointerLit(static_cast<unsigned long long>(size)));
   } else {
+    const unsigned long long magnitude =
+        0ULL - static_cast<unsigned long long>(idx);
     return pa(base,
               Expr::fn("$sub.ref", pointerLit(0ULL),
-                       pointerLit((unsigned long long)std::abs(idx))),
-              pointerLit(size));
+                       pointerLit(magnitude)),
+              pointerLit(static_cast<unsigned long long>(size)));
   }
 }
 
-const Expr *SmackRep::pa(const Expr *base, const Expr *idx, unsigned size) {
-  return pa(base, idx, pointerLit(size));
+const Expr *SmackRep::pa(const Expr *base, const Expr *idx, uint64_t size) {
+  return pa(base, idx, pointerLit(static_cast<unsigned long long>(size)));
 }
 
 const Expr *SmackRep::pa(const Expr *base, unsigned long long offset) {
@@ -854,9 +925,12 @@ const Expr *SmackRep::pointerLit(unsigned long long v) {
 const Expr *SmackRep::pointerLit(long long v) {
   if (v >= 0)
     return pointerLit((unsigned long long)v);
-  else
+  else {
+    const unsigned long long magnitude =
+        0ULL - static_cast<unsigned long long>(v);
     return Expr::fn("$sub.ref", pointerLit(0ULL),
-                    pointerLit((unsigned long long)std::abs(v)));
+                    pointerLit(magnitude));
+  }
 }
 
 const Expr *SmackRep::integerLit(unsigned long long v, unsigned width) {
@@ -869,8 +943,10 @@ const Expr *SmackRep::integerLit(long long v, unsigned width) {
   else {
     std::stringstream op;
     op << "$sub." << (SmackOptions::BitPrecise ? "bv" : "i") << width;
+    const unsigned long long magnitude =
+        0ULL - static_cast<unsigned long long>(v);
     return Expr::fn(op.str(), integerLit(0ULL, width),
-                    integerLit((unsigned long long)std::abs(v), width));
+                    integerLit(magnitude, width));
   }
 }
 
@@ -999,7 +1075,8 @@ const Expr *SmackRep::ptrArith(const llvm::GetElementPtrInst *I) {
   std::vector<Value *> indices;
   for (unsigned i = 1; i < I->getNumOperands(); i++)
     indices.push_back(I->getOperand(i));
-  return ptrArith(I->getPointerOperand(), I->getSourceElementType(), indices);
+  return ptrArith(I->getPointerOperand(), I->getSourceElementType(), indices,
+                  I->hasNoUnsignedSignedWrap());
 }
 
 const Expr *SmackRep::ptrArith(const llvm::ConstantExpr *CE) {
@@ -1008,80 +1085,97 @@ const Expr *SmackRep::ptrArith(const llvm::ConstantExpr *CE) {
   for (unsigned i = 1; i < CE->getNumOperands(); i++)
     indices.push_back(CE->getOperand(i));
   auto *GEP = llvm::cast<GEPOperator>(CE);
-  return ptrArith(CE->getOperand(0), GEP->getSourceElementType(), indices);
+  return ptrArith(CE->getOperand(0), GEP->getSourceElementType(), indices,
+                  GEP->hasNoUnsignedSignedWrap());
 }
 
 const Expr *SmackRep::ptrArith(const llvm::Value *p,
                                llvm::Type *sourceElementType,
-                               llvm::ArrayRef<llvm::Value *> indices) {
+                               llvm::ArrayRef<llvm::Value *> indices,
+                               bool noUnsignedSignedWrap) {
   using namespace llvm;
 
   const Expr *e = expr(p);
+  const unsigned indexBits = targetData->getIndexTypeSizeInBits(p->getType());
+  if (indexBits != ptrSizeInBits || indexBits == 0 || indexBits > 64)
+    llvm::report_fatal_error(
+        "SMACK cannot soundly lower a GEP whose DataLayout index width "
+        "differs from its pointer width");
 
-  enum class GepStateKind { Flat, StructOuter, VectorOuter };
+  const bool allConstant =
+      llvm::all_of(indices, [](const llvm::Value *index) {
+        return llvm::isa<llvm::ConstantInt>(index);
+      });
+  if (!allConstant && !SmackOptions::BitPrecisePointers &&
+      !noUnsignedSignedWrap)
+    llvm::report_fatal_error(
+        "SMACK cannot soundly lower a dynamic GEP to mathematical Boogie "
+        "pointer arithmetic without LLVM's nusw/inbounds guarantee; use "
+        "bit-precise pointers or preserve the GEP no-wrap flag");
+  if (allConstant) {
+    int64_t exactOffset = 0;
+    if (!exactNoWrapConstantGepOffset(sourceElementType, indices, indexBits,
+                                      *targetData, exactOffset))
+      llvm::report_fatal_error(
+          "SMACK cannot soundly lower a constant GEP whose mathematical "
+          "offset wraps at the target index width or uses a non-fixed "
+          "stride");
+  }
 
-  Type *indexedType = sourceElementType;
-  GepStateKind state = GepStateKind::Flat;
-
-  auto advance = [&](Type *next) {
-    if (auto *AT = dyn_cast_or_null<ArrayType>(next)) {
-      indexedType = AT->getElementType();
-      state = GepStateKind::Flat;
-    } else if (auto *VT = dyn_cast_or_null<VectorType>(next)) {
-      indexedType = VT;
-      state = GepStateKind::VectorOuter;
-    } else if (auto *ST = dyn_cast_or_null<StructType>(next)) {
-      indexedType = ST;
-      state = GepStateKind::StructOuter;
-    } else {
-      indexedType = nullptr;
-      state = GepStateKind::Flat;
-    }
-  };
-
+  auto GTI = llvm::gep_type_begin(sourceElementType, indices);
   for (auto *index : indices) {
-    if (state == GepStateKind::StructOuter) {
-      auto *st = llvm::cast<StructType>(indexedType);
+    if (GTI.isStruct()) {
+      auto *st = GTI.getStructType();
       auto *ci = dyn_cast<ConstantInt>(index);
-      if (!ci || !st->indexValid(ci)) {
-        advance(nullptr);
-        continue;
-      }
+      if (!ci || !st->indexValid(ci))
+        llvm::report_fatal_error(
+            "SMACK encountered an invalid non-constant struct GEP index");
 
       unsigned fieldNo = ci->getZExtValue();
-      e = pa(e, offset(st, fieldNo), 1);
-      advance(st->getElementType(fieldNo));
+      const uint64_t fieldOffset = offset(st, fieldNo);
+      if (fieldOffset >
+          static_cast<uint64_t>(std::numeric_limits<long long>::max()))
+        llvm::report_fatal_error(
+            "SMACK cannot soundly lower a struct GEP field offset larger "
+            "than signed 64-bit arithmetic");
+      e = pa(e, static_cast<long long>(fieldOffset), 1);
     } else {
-      Type *et = indexedType;
-      if (state == GepStateKind::VectorOuter)
-        et = llvm::cast<VectorType>(indexedType)->getElementType();
-
-      if (!et || !et->isSized()) {
-        advance(nullptr);
-        continue;
-      }
-
-      if (!index->getType()->isIntegerTy()) {
-        advance(et);
-        continue;
-      }
+      Type *et = GTI.getIndexedType();
+      if (!et || !et->isSized() || !index->getType()->isIntegerTy() ||
+          (GTI.isVector() && !targetData->typeSizeEqualsStoreSize(et)))
+        llvm::report_fatal_error(
+            "SMACK cannot soundly lower a GEP with a non-fixed or "
+            "non-byte-addressable sequential element");
+      const TypeSize strideSize =
+          GTI.getSequentialElementStride(*targetData);
+      if (strideSize.isScalable())
+        llvm::report_fatal_error(
+            "SMACK cannot soundly lower a scalable-vector GEP");
+      const uint64_t stride = strideSize.getFixedValue();
 
       if (const ConstantInt *ci = dyn_cast<ConstantInt>(index)) {
-        // First check if the result of multiplication fits in 64 bits
         const APInt &idx = ci->getValue();
-        APInt size(idx.getBitWidth(), storageSize(et));
-        APInt result = idx * size;
-        assert(result.isSignedIntN(64) &&
-               "Index value too large (or too small if negative)");
-        e = pa(e, (long long)ci->getSExtValue(), storageSize(et));
-      } else
+        if (!idx.isSignedIntN(64) || !idx.isSignedIntN(indexBits))
+          llvm::report_fatal_error(
+              "SMACK cannot soundly lower a constant GEP index that changes "
+              "value at the target index width");
+        const long long signedIndex = ci->getSExtValue();
+        const __int128 product = static_cast<__int128>(signedIndex) *
+                                 static_cast<__int128>(stride);
+        if (product < std::numeric_limits<long long>::min() ||
+            product > std::numeric_limits<long long>::max())
+          llvm::report_fatal_error(
+              "SMACK cannot soundly lower a constant GEP product outside "
+              "signed 64-bit arithmetic");
+        e = pa(e, signedIndex, stride);
+      } else {
         e = pa(e,
                integerToPointer(expr(index),
                                 index->getType()->getIntegerBitWidth()),
-               storageSize(et));
-
-      advance(et);
+               stride);
+      }
     }
+    ++GTI;
   }
 
   return e;
@@ -1580,7 +1674,7 @@ std::list<Decl *> SmackRep::globalDecl(const llvm::GlobalValue *v) {
   if (isCodeString(v))
     return decls;
 
-  unsigned size = 0;
+  uint64_t size = 0;
   bool external = false;
 
   if (const GlobalVariable *g = dyn_cast<const GlobalVariable>(v)) {
@@ -1608,14 +1702,40 @@ std::list<Decl *> SmackRep::globalDecl(const llvm::GlobalValue *v) {
     size = targetData->getPrefTypeAlign(v->getType()).value();
 
   // Add padding between globals to be able to check memory overflows/underflows
-  const unsigned globalsPadding = 1024;
+  const uint64_t globalsPadding = 1024;
+  if (ptrSizeInBits != 32 && ptrSizeInBits != 64)
+    llvm::report_fatal_error(
+        "SMACK global layout supports only 32- or 64-bit pointers");
+  const long long addressMin =
+      ptrSizeInBits == 32 ? std::numeric_limits<int32_t>::min()
+                          : std::numeric_limits<long long>::min();
+  auto placeBelow = [addressMin](long long &cursor, uint64_t amount,
+                                 StringRef objectName) {
+    const uint64_t maxSigned =
+        static_cast<uint64_t>(std::numeric_limits<long long>::max());
+    if (amount > maxSigned ||
+        cursor < addressMin + static_cast<long long>(amount))
+      llvm::report_fatal_error(
+          "SMACK global address layout exceeds the target pointer range "
+          "while placing " +
+          objectName);
+    cursor -= static_cast<long long>(amount);
+    return cursor;
+  };
   if (external) {
     decls.push_back(Decl::axiom(Expr::eq(
         Expr::id(name), Expr::fn("$add.ref", Expr::id(Naming::GLOBALS_BOTTOM),
-                                 pointerLit(externsOffset -= size)))));
+                                 pointerLit(placeBelow(externsOffset, size,
+                                                       v->getName()))))));
   } else {
+    if (size > std::numeric_limits<uint64_t>::max() - globalsPadding)
+      llvm::report_fatal_error("SMACK global allocation size overflows while "
+                               "placing " +
+                               v->getName());
     decls.push_back(Decl::axiom(Expr::eq(
-        Expr::id(name), pointerLit(globalsOffset -= (size + globalsPadding)))));
+        Expr::id(name),
+        pointerLit(placeBelow(globalsOffset, size + globalsPadding,
+                              v->getName())))));
   }
 
   if (!llvm::isa<Function>(v))

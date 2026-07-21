@@ -38,9 +38,12 @@ inline constexpr std::nullopt_t None = std::nullopt;
 
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 
+#include <limits>
 #include <utility>
 
 #if LLVM_VERSION_MAJOR >= 22 && defined(SMACK_ENABLE_SEADSA_LEGACY_LLVM_NAMES)
@@ -87,6 +90,69 @@ inline uint64_t fixedTypeAllocSize(const llvm::DataLayout &DL, llvm::Type *T) {
 inline uint64_t fixedTypeAllocSize(const llvm::DataLayout &DL,
                                    const llvm::Type *T) {
   return fixedTypeAllocSize(DL, const_cast<llvm::Type *>(T));
+}
+
+// Return the constant byte offset only for the no-wrap subset where LLVM's
+// target-index-width GEP arithmetic and SMACK's mathematical Boogie pointer
+// arithmetic are identical. Dynamic indices are reported as unsupported.
+// `gep_type_iterator` is authoritative for sequential strides, including the
+// tightly packed vector-element case.
+template <typename T>
+inline bool exactNoWrapConstantGepOffset(
+    llvm::Type *sourceElementType, llvm::ArrayRef<T> indices,
+    unsigned indexBits, const llvm::DataLayout &DL, int64_t &offset) {
+  if (!sourceElementType || indexBits == 0 || indexBits > 64)
+    return false;
+
+  const __int128 min = -(__int128{1} << (indexBits - 1));
+  const __int128 max = (__int128{1} << (indexBits - 1)) - 1;
+  __int128 total = 0;
+  auto GTI = llvm::gep_type_begin(sourceElementType, indices);
+
+  for (const auto *index : indices) {
+    const auto *CI = llvm::dyn_cast<llvm::ConstantInt>(index);
+    if (!CI)
+      return false;
+
+    __int128 term = 0;
+    if (GTI.isStruct()) {
+      llvm::StructType *ST = GTI.getStructType();
+      if (!ST->indexValid(CI))
+        return false;
+      const uint64_t fieldOffset =
+          DL.getStructLayout(ST)->getElementOffset(CI->getZExtValue());
+      term = static_cast<__int128>(fieldOffset);
+    } else {
+      llvm::Type *elementType = GTI.getIndexedType();
+      if (!elementType || !elementType->isSized() ||
+          (GTI.isVector() && !DL.typeSizeEqualsStoreSize(elementType)))
+        return false;
+      const llvm::TypeSize strideSize = GTI.getSequentialElementStride(DL);
+      if (strideSize.isScalable())
+        return false;
+
+      const llvm::APInt &rawIndex = CI->getValue();
+      if (!rawIndex.isSignedIntN(64) ||
+          !rawIndex.isSignedIntN(indexBits))
+        return false;
+      const int64_t signedIndex = rawIndex.getSExtValue();
+      term = static_cast<__int128>(signedIndex) *
+             static_cast<__int128>(strideSize.getFixedValue());
+      if (term < min || term > max)
+        return false;
+    }
+
+    total += term;
+    if (total < min || total > max)
+      return false;
+    ++GTI;
+  }
+
+  if (total < std::numeric_limits<int64_t>::min() ||
+      total > std::numeric_limits<int64_t>::max())
+    return false;
+  offset = static_cast<int64_t>(total);
+  return true;
 }
 
 // Constructs a pass and hands ownership to llvm::legacy::PassManager via

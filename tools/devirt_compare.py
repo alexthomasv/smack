@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Compare indirect-call devirtualization precision across analyzers.
 
-The built-in candidates run SMACK/llvm2bpl with different analysis flags and
-read the canonical ``-smack-devirt-report`` JSON. External candidates run SVF or
-PhASAR as hard comparison dependencies and normalize their call-target output
-against the same SMACK callsite inventory.
+The built-in candidate runs SMACK/llvm2bpl and reads the canonical
+``-smack-devirt-report`` JSON. External candidates run SVF or PhASAR as hard
+comparison dependencies and normalize their call-target output against the
+same SMACK callsite inventory.
 """
 
 from __future__ import annotations
@@ -22,20 +22,9 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 2
-SUPPORTED_REPORT_SCHEMAS = {1, 2}
+SUPPORTED_REPORT_SCHEMAS = {1, 2, 3}
 
-DEFAULT_CANDIDATES = (
-    "smack-default=-smack-memory-partitioner=sea-dsa",
-    "sea-dsa-ci=-sea-dsa=ci -smack-memory-partitioner=sea-dsa",
-    "sea-dsa-bu=-sea-dsa=bu -smack-memory-partitioner=sea-dsa",
-    "sea-dsa-butd-cs=-sea-dsa=butd-cs -smack-memory-partitioner=sea-dsa",
-    "sea-dsa-cs=-sea-dsa=cs -smack-memory-partitioner=sea-dsa",
-    "sea-dsa-flat=-sea-dsa=flat -smack-memory-partitioner=sea-dsa",
-    (
-        "teadsa-butd-cs-type-aware=-sea-dsa=butd-cs -sea-dsa-type-aware "
-        "-smack-memory-partitioner=sea-dsa"
-    ),
-)
+DEFAULT_CANDIDATES = ("smack-default=",)
 
 DEFAULT_FIXTURES = (
     "func_ptr=test/c/data/func_ptr.c:main",
@@ -508,8 +497,6 @@ def _normalize_callsite(callsite: dict[str, Any], *, index: int) -> dict[str, An
     normalized.setdefault("complete", False)
     normalized.setdefault("sea_dsa_complete", False)
     normalized.setdefault("sea_dsa_target_count", 0)
-    normalized.setdefault("fallback_target_count", 0)
-    normalized.setdefault("source", "unknown")
     normalized.setdefault("reason", "")
 
     targets = normalized.get("targets", [])
@@ -517,6 +504,17 @@ def _normalize_callsite(callsite: dict[str, Any], *, index: int) -> dict[str, An
         raise CompareError(f"devirt report callsite {index} has invalid targets")
     normalized["targets"] = sorted(set(targets))
     normalized["target_count"] = len(normalized["targets"])
+    if "source" not in normalized:
+        if normalized["reason"] == "svf-complete":
+            normalized["source"] = "svf"
+        elif normalized.get("complete") is True:
+            normalized["source"] = "complete"
+        else:
+            normalized["source"] = "fallback"
+    normalized.setdefault(
+        "fallback_target_count",
+        0 if normalized.get("complete") is True else normalized["target_count"],
+    )
 
     for field in (
         "callsite_index",

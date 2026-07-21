@@ -1,15 +1,8 @@
 //
 // This file is distributed under the MIT License. See LICENSE for details.
 //
-// NewPM bridge: expose the legacy `smack::DSAWrapper` ModulePass (now backed by
-// SVF's Andersen points-to + union-find region partition) as a NewPM
-// ModuleAnalysis. The analysis owns a `legacy::PassManager` for the lifetime of
-// the cached result; the wrapped `DSAWrapper*` is non-owning (the legacy PM owns
-// it). Consumer NewPM passes obtain `Result` via
-// `MAM.getResult<DSAWrapperAnalysis>(M)` and call its forwarding methods.
-//
-// NOTE: the canonical, proven path is the LEGACY PassManager (SMACK defaults to
-// SMACK_NEW_PM=OFF). This NewPM bridge only needs to compile.
+// NewPM bridge for the legacy pass that constructs the exact-IR-epoch SVF
+// analysis consumed by devirtualization and memory partitioning.
 //
 
 #ifndef SMACK_DSAWRAPPER_ANALYSIS_H
@@ -36,23 +29,9 @@ public:
     std::unique_ptr<llvm::legacy::PassManager> pm;
     DSAWrapper *wrapper = nullptr;
 
-    // Forward every DSAWrapper public method so NewPM consumers can call
-    // these on the Result without dereferencing `wrapper` themselves.
-    bool isStaticInitd(MemNodeRef n) { return wrapper->isStaticInitd(n); }
-    bool isMemOpd(MemNodeRef n) { return wrapper->isMemOpd(n); }
-    bool isRead(const llvm::Value *V) { return wrapper->isRead(V); }
-    unsigned getPointedTypeSize(const llvm::Value *v) {
-      return wrapper->getPointedTypeSize(v);
-    }
-    unsigned getOffset(const llvm::Value *v) { return wrapper->getOffset(v); }
-    MemNodeRef getNode(const llvm::Value *v) { return wrapper->getNode(v); }
-    bool isTypeSafe(const llvm::Value *v) { return wrapper->isTypeSafe(v); }
-    unsigned getNumGlobals(MemNodeRef n) { return wrapper->getNumGlobals(n); }
-
     // MAM invalidation hook. Honor explicit preservation: invalidate when a
-    // transform reports `none()`. Consumers (Regions, SmackModuleGenerator)
-    // re-request the analysis on each pass entry so they always see the live
-    // `wrapper`.
+    // transform reports `none()`. A recomputation compares the current module
+    // with the cached SVF snapshot and fails closed to universal on any drift.
     bool invalidate(llvm::Module &, const llvm::PreservedAnalyses &PA,
                     llvm::ModuleAnalysisManager::Invalidator &) {
       auto PAC = PA.getChecker<DSAWrapperAnalysis>();

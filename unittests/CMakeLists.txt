@@ -27,14 +27,12 @@ smack_force_llvm_compat(smack_unittests)
 
 target_include_directories(smack_unittests PRIVATE
   ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/sea-dsa/include
 )
 
 target_link_libraries(smack_unittests PRIVATE
   -Wl,--start-group
   smackTranslator
   utils
-  SeaDsaAnalysis
   -Wl,--end-group
   ${LLVM_LIBS}
   ${LLVM_SYSTEM_LIBS}

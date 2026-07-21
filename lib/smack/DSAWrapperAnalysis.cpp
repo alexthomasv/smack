@@ -17,9 +17,7 @@ DSAWrapperAnalysis::run(llvm::Module &M,
                         llvm::ModuleAnalysisManager & /*MAM*/) {
   Result r;
 
-  // The SVF-backed DSAWrapper runs SVF directly inside runOnModule and has no
-  // LLVM/sea-dsa analysis dependency, so a bare legacy PM with just the wrapper
-  // suffices.
+  // DSAWrapper has no LLVM analysis dependency, so a bare legacy PM suffices.
   r.pm = std::make_unique<llvm::legacy::PassManager>();
   auto *dsa = new DSAWrapper();
   r.wrapper = dsa;

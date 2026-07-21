@@ -9,21 +9,16 @@ through legacy `llvm2bpl`, optionally through the NewPM build, captures
 `--smack-pipeline-report` JSON, records `opt-22 --print-passes`, and writes
 `audit.json` plus `audit.md`. Timings are report-only diagnostics, not budgets.
 
-Memory partitioning now has a separate probe:
-`tools/memory_partition_compare.py`. It runs the same linked-bitcode style used
-by the Python integration tests, emits `--smack-memory-partition-report` JSON for
-each candidate, and ranks candidates by a map-count-first rule: fewer failed
-fixtures, more emitted `$M.*` Boogie maps, more regions, more typed regions,
-fewer fallback/imprecise regions, fewer merges, then lower wall time.
-
 ## Current Baseline
 
 - SMACK is pinned to LLVM 22 in `bin/versions`; the local toolchain may report a
   nearby LLVM 22 patch release through `llvm-config-22 --version`.
 - The legacy pipeline remains the production `llvm2bpl` path.
 - `-DSMACK_NEW_PM=ON` enables the full NewPM path for equivalence and audit work.
-- sea-dsa is still legacy-PM code and is bridged into NewPM through
-  `DSAWrapperAnalysis` / `CompleteCallGraphAnalysis`.
+- Memory uses a fail-closed SVF Andersen component partition. A module stays
+  split only when every translated address has a concrete component and every
+  pointer source is supported by both SVF and the modular Boogie encoding;
+  otherwise it uses one universal mutable map.
 - CI already runs ruff, C++ gtests, Python tests, and the regression matrix; the
   audit adds artifacts only and must not fail because one runner is slower.
 
@@ -34,9 +29,9 @@ fewer fallback/imprecise regions, fewer merges, then lower wall time.
 | `bpl-output-streaming` | Efficiency | Early reports show Boogie emission dominates translator time on small and medium fixtures, and both BPL printers stage output in `std::ostringstream` before writing it. | Prototype direct streaming from `Program::print` to the destination stream, then require byte-for-byte BPL equality and timing comparison. |
 | `newpm-analysis-preservation` | NewPM | Many SMACK NewPM siblings conservatively return `PreservedAnalyses::none()` after mutation. More precise preservation may reduce repeated analysis work once NewPM is the default candidate. | Audit each pass for DominatorTree, LoopInfo, and module-analysis preservation before changing pass order. |
 | `llvm-standard-instrumentations` | Observability | LLVM already provides NewPM instrumentation helpers; SMACK now has custom report callbacks and should compare them against upstream facilities. | Prototype `StandardInstrumentations` / time profiling behind the existing report flag and keep the current JSON schema stable unless the replacement is clearly better. |
-| `llvm22-ptrtoaddr` | LLVM IR | LLVM 22 introduced `ptrtoaddr`, which separates address extraction from pointer provenance capture. SMACK still has explicit ptr-to-int cleanup and sea-dsa-based pointer reasoning. | Add focused IR fixtures for `ptrtoaddr`; do not alter pointer lowering until those fixtures preserve expected BPL behavior. |
+| `llvm22-ptrtoaddr` | LLVM IR | LLVM 22 introduced `ptrtoaddr`, which separates address extraction from pointer provenance capture. SMACK still has explicit ptr-to-int cleanup. | Add focused IR fixtures for `ptrtoaddr`; do not alter pointer lowering until those fixtures preserve expected BPL behavior. |
 | `llvm-attributor-candidates` | LLVM features | LLVM 22 exposes inference passes such as Attributor that may simplify IR before translation, but verifier semantics can be fragile. | Run candidate passes only in exploratory builds and diff emitted BPL before considering production use. |
-| `memory-partitioning-evidence` | Memory model | SMACK now defaults to SeaDsa bottom-up splitting because it emits more disjoint maps on the BearSSL fixture. The comparison suite also names TeaDsa-style SeaDsa and the opt-in LLVM-AA overlay so they can be ranked against the default. | Run `tools/memory_partition_compare.py`, inspect `partition-comparison.md`, then keep only refinements that improve map count without verifier regressions. |
+| `memory-separation-certificates` | Memory model | More maps help Boogie only when every pair is proved address-disjoint for every defined execution. | Preserve the current SVF component certificate and its universal fallback; add precision only with a regression that refutes the one-map reference and a proof that the new source cannot cross components. |
 
 ## Report-Only Workflow
 
@@ -55,53 +50,35 @@ Expected outputs:
 - `*.legacy.json` and `*.newpm.json`: raw per-fixture pipeline reports.
 - `*.legacy.bpl` and `*.newpm.bpl`: generated BPL for follow-up diffing.
 
-## Memory Partitioning Workflow
+## Memory Model Invariant
 
-```sh
-python3 tools/memory_partition_compare.py \
-  --llvm2bpl build-llvm22c/llvm2bpl \
-  --out-dir build/memory-partition-compare
-```
-
-Default candidates:
-
-- `sea-dsa-ci`, `sea-dsa-bu`, `sea-dsa-butd-cs`, `sea-dsa-cs`, `sea-dsa-flat`
-- `teadsa-butd-cs-type-aware`
-- `cell-refined-ci`, `cell-refined-butd-cs`
-- `aa-refined-bu`, `aa-refined-teadsa`
-
-Expected outputs:
-
-- `partition-comparison.json`: machine-readable candidate runs, raw report paths,
-  and ranking data.
-- `partition-comparison.md`: compact table for CI artifacts and review.
-- optional external candidate probes when `--probe-external-candidates` or
-  `--external-candidate NAME=TOOL[,TOOL]` is used. SVF `wpa` can now run as a
-  sidecar MemorySSA comparison (`distinct`, `intra-disjoint`, and
-  `inter-disjoint`); those rows are intentionally kept out of the main SMACK
-  `$M.*` ranking until an adapter can emit sound SMACK memory maps.
-- `*.memory.json`: raw memory partition reports from `llvm2bpl`.
-- `*.bpl`: generated Boogie files for behavioral diffing.
-
-Current implementation notes:
-
-- The production default remains `sea-dsa`, now with `-sea-dsa=bu`.
-- `--sea-dsa-mode` exposes SeaDsa `ci`, `bu`, `butd-cs`, `cs`, and `flat` through
-  the Python driver so context-sensitive modes can be tested without patching.
-- `--memory-partitioner=cell-refined` is experimental and opt-in. It keeps the
-  old merge behavior except that complicated regions with different concrete
-  representatives are no longer forced together only because both are
-  complicated.
-- `--memory-partitioner=aa-refined` is experimental and opt-in. It starts from
-  SeaDsa-derived regions and only avoids a merge when LLVM AA proves `NoAlias`
-  for a valid same-function query.
+- Production translation uses SVF Andersen only. For every pointer `p`, its
+  points-to objects are unioned into one equivalence component; SVF field
+  objects are also unioned with their base allocation. Two different Boogie
+  maps therefore require disjoint concrete SVF object sets.
+- The split is fail-closed. Unresolved or black-hole targets, `inttoptr`,
+  pointer formals/returns/loads/globals, allocation wrappers, unsupported calls
+  or intrinsics, unstable/linker-defined globals, erased address spaces,
+  variadic pointer extraction, pointer freeze/atomics, an IR-epoch mismatch,
+  and a second module in the same process all select one universal map.
+- All maps are mutable. LLVM `noalias`, alias scopes, TBAA, constant-memory
+  status, field windows, an external oracle, and entry-reachability do not
+  create components. In particular, argument `noalias` permits read/read
+  overlap and cannot prove the address-disjointness required by separate maps.
+- Every devirtualized indirect call retains a residual unknown-target branch.
+  That branch has a modifies-all Boogie summary, and any IR rewrite after SVF
+  invalidates the exact snapshot and forces universal memory.
+- `--no-memory-splitting` is the explicit opt-out and always selects one map.
+  `--smack-memory-partition-report` records the component count, fallback
+  evidence, unsupported origins, unresolved targets, and snapshot status.
 - LLVM `MemorySSA` is useful for future sparse memory-use evidence, but it is
   intraprocedural and should be treated as a complement to pointer partitioning,
   not a drop-in replacement for SeaDsa-derived regions.
-- Future partitioning candidates worth prototyping are an SVF-backed points-to
-  importer, TeaDsa-style anti-oversharing refinements, LLVM AA/noalias/TBAA
-  evidence layered on top of BU, and segmented-memory-style grouping for large
-  symbolic pointer target sets.
+- Future precision work should first strengthen Boogie procedure/allocation
+  contracts so pointer formals, returns, loads, and allocation results remain
+  constrained at modular call boundaries. Those contracts can safely remove
+  individual fallback gates once their generated Boogie obligations pass the
+  one-map differential regressions.
 
 ## References
 
@@ -112,6 +89,7 @@ Current implementation notes:
 - [LLVM optimization remarks](https://llvm.org/docs/Remarks.html)
 - [LLVM MemorySSA](https://www.llvm.org/docs/MemorySSA.html)
 - [LLVM Alias Analysis Infrastructure](https://llvm.org/docs/AliasAnalysis.html)
+- [LLVM 21.1 `noalias` semantics](https://releases.llvm.org/21.1.0/docs/LangRef.html#noalias)
 - [SMACK: Decoupling Source Language Details from Verifier Implementations](https://soarlab.org/papers/2014_cav_re.pdf)
 - [Data Structure Analysis: An Efficient Context-Sensitive Heap Analysis](https://llvm.org/pubs/2003-04-29-DataStructureAnalysisTR.html)
 - [Unification-based Pointer Analysis without Oversharing](https://arxiv.org/abs/1906.01706)

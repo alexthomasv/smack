@@ -10,8 +10,6 @@
 
 namespace smack {
 
-class DSAWrapper;
-
 class CodifyStaticInits : public llvm::ModulePass {
 private:
   const llvm::DataLayout *TD;
@@ -23,8 +21,8 @@ public:
   virtual bool runOnModule(llvm::Module &M) override;
   virtual void getAnalysisUsage(llvm::AnalysisUsage &AU) const override;
 
-  // Shared body for legacy + NewPM. Caller supplies the DSAWrapper.
-  static bool runImpl(llvm::Module &M, DSAWrapper &dsa);
+  // Shared body for legacy + NewPM. Every initialized global is emitted.
+  static bool runImpl(llvm::Module &M);
 };
 
 class CodifyStaticInitsNewPM

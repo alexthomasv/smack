@@ -5,6 +5,7 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/LinkAllPasses.h"
@@ -186,6 +187,50 @@ void writeMemoryPartitionReport(const smack::SmackMemoryPartitionReport &report,
     J.attribute("memory_access_count", report.memoryAccessCount);
     J.attribute("merge_count", report.mergeCount);
     J.attribute("late_region_count", report.lateRegionCount);
+    J.attribute("svf_universal_region", report.svfUniversalRegion);
+    J.attribute("svf_unresolved_access_count",
+                report.svfUnresolvedAccessCount);
+    J.attribute("svf_unknown_target_access_count",
+                report.svfUnknownTargetAccessCount);
+    J.attribute("svf_unsupported_pointer_origin_count",
+                report.svfUnsupportedPointerOriginCount);
+    J.attribute("svf_scanned_function_count", report.svfScannedFunctionCount);
+    J.attribute("svf_ir_snapshot_match", report.svfIrSnapshotMatch);
+    // The unresolved counters cover the same module-wide audit reported by
+    // svf_scanned_function_count. Reachability is reported separately so an
+    // audit can confirm that uncalled emitted definitions were checked too.
+    J.attribute("svf_live_unresolved_access_count",
+                report.svfUnresolvedAccessCount);
+    J.attribute("svf_blackhole_access_count",
+                report.svfUnknownTargetAccessCount);
+    J.attribute("svf_reachable_function_count",
+                report.svfReachableFunctionCount);
+    J.attribute("svf_noalias_seed_count", report.svfNoAliasSeedCount);
+    J.attribute("svf_closed_input_contract",
+                report.svfClosedInputContract);
+    J.attribute("svf_allocator_model", report.svfAllocatorModel);
+    J.attribute("svf_noalias_seeded_region_count",
+                report.svfNoAliasSeededRegionCount);
+    J.attribute("svf_stack_region_count", report.svfStackRegionCount);
+    J.attribute("svf_heap_region_count", report.svfHeapRegionCount);
+    J.attribute("svf_global_region_count", report.svfGlobalRegionCount);
+    J.attribute("svf_mixed_authority_region_count",
+                report.svfMixedAuthorityRegionCount);
+    J.attributeArray("svf_region_authorities", [&] {
+      for (const auto &authority : report.svfRegionAuthorities) {
+        J.object([&] {
+          J.attribute("region", authority.region);
+          J.attribute("noalias_seed", authority.noAliasSeed);
+          J.attribute("stack_allocation", authority.stackAllocation);
+          J.attribute("heap_allocation", authority.heapAllocation);
+          J.attribute("global_allocation", authority.globalAllocation);
+        });
+      }
+    });
+    J.attribute("svf_field_windows", report.svfFieldWindows);
+    J.attribute("svf_offset_known_count", report.svfOffsetKnownCount);
+    J.attribute("windowed_region_count", report.windowedRegionCount);
+    J.attribute("split_component_count", report.splitComponentCount);
     J.attribute("oracle_access_count", report.oracleAccessCount);
     J.attribute("oracle_callsite_effect_count",
                 report.oracleCallsiteEffectCount);
@@ -308,7 +353,9 @@ int main(int argc, char **argv) {
   if (!EmitDevirtBC.empty()) {
     smack::initializeSmackPipelinePasses();
     legacy::PassManager devirtPM;
+    devirtPM.add(createVerifierPass());
     devirtPM.add(new Devirtualize());
+    devirtPM.add(createVerifierPass());
     devirtPM.run(*module);
     std::error_code DevirtEC;
     raw_fd_ostream OS(EmitDevirtBC, DevirtEC, sys::fs::OF_None);
@@ -321,8 +368,9 @@ int main(int argc, char **argv) {
 
 #ifdef SMACK_NEW_PM
   // Build-time opt-in to NewPM full pipeline. Runs Tier A+B+C+D NewPM
-  // siblings via PassBuilder/ModulePassManager. The Tier C analyses
-  // (DSAWrapperAnalysis, RegionsAnalysis) wrap the SVF-backed DSAWrapper.
+  // siblings via PassBuilder/ModulePassManager. DSAWrapperAnalysis supplies
+  // the exact-epoch SVF graph to devirtualization and RegionsAnalysis; unsafe
+  // or unsupported partition evidence makes RegionsAnalysis use one map.
   if (!OutputFilename.empty()) {
     std::error_code EC;
     auto F = new ToolOutputFile(OutputFilename.c_str(), EC, sys::fs::OF_None);

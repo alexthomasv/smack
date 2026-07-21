@@ -7,7 +7,7 @@
 //
 // Use this for pass-level tests that operate purely on a Module —
 // callers, GEP shape walking, instruction visitors, naming. For tests
-// that need the full SMACK pipeline (Regions + sea-dsa), prefer the
+// that need the full SMACK pipeline (Regions + SVF), prefer the
 // end-to-end regtest matrix instead.
 //
 

@@ -32,6 +32,8 @@ public:
   // Skip the SVF-based devirtualization pass (Devirtualize). Off by default, so
   // indirect calls SVF resolves completely get rewritten to direct dispatch.
   static const llvm::cl::opt<bool> SkipDevirt;
+  // Force bytewise maps in bit-precise mode instead of using SVF component
+  // type information to select a typed representation.
   static const llvm::cl::opt<bool> NoByteAccessInference;
   static const llvm::cl::opt<bool> FloatEnabled;
   static const llvm::cl::opt<bool> MemorySafety;

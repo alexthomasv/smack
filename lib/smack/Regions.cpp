@@ -7,9 +7,11 @@
 #include "smack/Debug.h"
 #include "smack/InitializePasses.h"
 #include "smack/LlvmCompat.h"
+#include "smack/Naming.h"
 #include "smack/SmackOptions.h"
 #include "smack/SmackPipeline.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -22,17 +24,12 @@ namespace smack {
 const DataLayout *Region::DL = nullptr;
 DSAWrapper *Region::DSA = nullptr;
 
-namespace {
+Region::Region()
+    : representative(nullptr), type(nullptr), singleton(false), allocated(true),
+      bytewise(SmackOptions::BitPrecise), incomplete(true), complicated(true),
+      collapsed(true) {}
 
-Function *queryFunctionForValue(const Value *V) {
-  if (auto *I = dyn_cast<Instruction>(V))
-    return const_cast<Function *>(I->getFunction());
-  if (auto *A = dyn_cast<Argument>(V))
-    return const_cast<Function *>(A->getParent());
-  if (auto *BB = dyn_cast<BasicBlock>(V))
-    return const_cast<Function *>(BB->getParent());
-  return nullptr;
-}
+namespace {
 
 // Opaque-pointer-safe access-type recovery: SMACK runs under opaque pointers,
 // where PointerType::getElementType() is gone. Recover the element type from a
@@ -62,7 +59,7 @@ void Region::init(Module &M, DSAWrapper &dsa) {
   DSA = &dsa;
 }
 
-bool Region::isSingleton(const Value *v, unsigned length) {
+bool Region::isSingleton(const Value *v, uint64_t length) {
   // TODO can we do something for non-global nodes?
   auto node = DSA->getNode(v);
 
@@ -74,20 +71,13 @@ bool Region::isAllocated(MemNodeRef N) { return DSA->isAllocated(N); }
 
 bool Region::isComplicated(MemNodeRef N) { return DSA->isComplicated(N); }
 
-void Region::init(const Value *V, const Type *accessType, unsigned length) {
+void Region::init(const Value *V, const Type *accessType, uint64_t length) {
   assert(V->getType()->isPointerTy() && "Expected pointer argument.");
   const Type *memoryType = accessType ? accessType : accessTypeFromUsers(V);
   if (!memoryType)
     memoryType = Type::getInt8Ty(V->getContext());
-  context = &V->getContext();
-  pointer = V;
-  function = queryFunctionForValue(V);
-  representative =
-      (DSA && !dyn_cast<ConstantPointerNull>(V)) ? DSA->getNode(V) : nullptr;
+  representative = DSA ? DSA->getNode(V) : nullptr;
   this->type = memoryType;
-  this->offset = DSA ? DSA->getOffset(V) : 0;
-  this->length = length;
-
   singleton = DL && representative && isSingleton(V, length);
   allocated = !representative || isAllocated(representative);
   bytewise = DSA && SmackOptions::BitPrecise &&
@@ -96,19 +86,18 @@ void Region::init(const Value *V, const Type *accessType, unsigned length) {
               (memoryType && memoryType->isIntegerTy(8)));
   incomplete = !representative || DSA->isIncomplete(representative);
   complicated = !representative || isComplicated(representative);
-  collapsed = !representative || DSA->isCollapsed(representative);
+  collapsed = DSA && DSA->usedUniversalRegion();
 }
 
 Region::Region(const Value *V) {
-  unsigned length =
-      DSA ? DSA->getPointedTypeSize(V) : std::numeric_limits<unsigned>::max();
+  uint64_t length = DSA ? DSA->getPointedTypeSize(V) : UNBOUNDED;
   init(V, nullptr, length);
 }
 
-Region::Region(const Value *V, unsigned length) { init(V, nullptr, length); }
+Region::Region(const Value *V, uint64_t length) { init(V, nullptr, length); }
 
 Region::Region(const Value *V, const Type *accessType) {
-  unsigned length = std::numeric_limits<unsigned>::max();
+  uint64_t length = UNBOUNDED;
   if (accessType && accessType->isSized() && DL)
     length = fixedTypeStoreSize(*DL, accessType);
   else if (DSA)
@@ -116,12 +105,12 @@ Region::Region(const Value *V, const Type *accessType) {
   init(V, accessType, length);
 }
 
-Region::Region(const Value *V, const Type *accessType, unsigned length) {
+Region::Region(const Value *V, const Type *accessType, uint64_t length) {
   init(V, accessType, length);
 }
 
 Region::Region(const LoadInst &I) {
-  unsigned length = std::numeric_limits<unsigned>::max();
+  uint64_t length = UNBOUNDED;
   if (I.getType()->isSized() && DL)
     length = fixedTypeStoreSize(*DL, I.getType());
   else if (DSA)
@@ -131,7 +120,7 @@ Region::Region(const LoadInst &I) {
 
 Region::Region(const StoreInst &I) {
   const Type *accessType = I.getValueOperand()->getType();
-  unsigned length = std::numeric_limits<unsigned>::max();
+  uint64_t length = UNBOUNDED;
   if (accessType->isSized() && DL)
     length = fixedTypeStoreSize(*DL, accessType);
   else if (DSA)
@@ -139,17 +128,8 @@ Region::Region(const StoreInst &I) {
   init(I.getPointerOperand(), accessType, length);
 }
 
-bool Region::isDisjoint(unsigned offset, unsigned length) {
-  return this->offset + this->length <= offset ||
-         offset + length <= this->offset;
-}
-
 void Region::merge(Region &R) {
   bool collapse = type != R.type;
-  unsigned long low = std::min(offset, R.offset);
-  unsigned long high = std::max(offset + length, R.offset + R.length);
-  offset = low;
-  length = high - low;
   singleton = singleton && R.singleton;
   allocated = allocated || R.allocated;
   bytewise = SmackOptions::BitPrecise && (bytewise || R.bytewise || collapse);
@@ -160,9 +140,7 @@ void Region::merge(Region &R) {
 }
 
 bool Region::overlaps(Region &R) {
-  return (incomplete && R.incomplete) || (complicated && R.complicated) ||
-         (representative == R.representative &&
-          (collapsed || !isDisjoint(R.offset, R.length)));
+  return representative == R.representative;
 }
 
 void Region::print(raw_ostream &O) {
@@ -172,7 +150,7 @@ void Region::print(raw_ostream &O) {
     O << *type;
   else
     O << "*";
-  O << ">[" << offset << "," << (offset + length) << "]{";
+  O << ">{";
   if (singleton)
     O << "S";
   if (bytewise)
@@ -200,38 +178,63 @@ namespace smack {
 
 void Regions::getAnalysisUsage(llvm::AnalysisUsage &AU) const {
   AU.setPreservesAll();
-  if (!SmackOptions::NoMemoryRegionSplitting)
+  if (!universalMode())
     AU.addRequired<DSAWrapper>();
 }
 
-void Regions::runImpl(Module &M, DSAWrapper &dsa) {
+bool Regions::universalMode() const {
+  return forceUniversal || SmackOptions::NoMemoryRegionSplitting;
+}
+
+void Regions::runUniversal() {
   regions.clear();
-  if (!SmackOptions::NoMemoryRegionSplitting) {
-    Region::init(M, dsa);
-    visit(M);
+  regions.emplace_back();
+  memoryAccessCount = 0;
+  mergeCount = 0;
+  lateRegionCount = 0;
+  initialScanComplete = true;
+}
+
+unsigned Regions::universalIdx() {
+  ++memoryAccessCount;
+  if (regions.empty())
+    regions.emplace_back();
+  return 0;
+}
+
+void Regions::runImpl(Module &M, DSAWrapper &dsa) {
+  if (universalMode()) {
+    runUniversal();
+    return;
   }
+  regions.clear();
+  memoryAccessCount = 0;
+  mergeCount = 0;
+  lateRegionCount = 0;
+  initialScanComplete = false;
+  Region::init(M, dsa);
+  visit(M);
+  initialScanComplete = true;
 }
 
 bool Regions::runOnModule(Module &M) {
-  // Shaobo: my understanding of how this class works:
-  // First, a bunch of instructions involving pointers are visited (via
-  // Regions::idx). During a visit on an instruction, a region is created
-  // (Region::init) for the pointer operand. Note that a region is always
-  // created for a pointer when it's visited, regardless of whether it alias
-  // with the existing ones.  A region can be roughly seen as a tuple of (cell,
-  // length) or (node, offset, length) since a cell is essentially a tuple of
-  // (node, offset). After a region is created, we will merge it to the existing
-  // ones if it overlaps with the them. So after this pass, we will get a bunch
-  // of regions which are mutually exclusive to each other.
-  // After that, SmackRep will call Regions::idx to get the region for a pointer
-  // operand, which repeats the aforementioned process. Note that we don't have
-  // fancy caching, so a region is created and merged everytime Regions::idx
-  // is called.
-  regions.clear();
-  if (!SmackOptions::NoMemoryRegionSplitting) {
-    Region::init(M, *this);
-    visit(M);
+  // Pre-scan every address translation will index. Regions with the same SVF
+  // union-find representative merge; distinct representatives remain distinct
+  // only after DSAWrapper has ruled out every unsupported/objectless origin.
+  // Later translation queries may reuse or append a proven component, while a
+  // missing representative fails closed in idx(Region &).
+  if (universalMode()) {
+    runUniversal();
+    return false;
   }
+  regions.clear();
+  memoryAccessCount = 0;
+  mergeCount = 0;
+  lateRegionCount = 0;
+  initialScanComplete = false;
+  Region::init(M, *this);
+  visit(M);
+  initialScanComplete = true;
 
   return false;
 }
@@ -241,8 +244,10 @@ llvm::AnalysisKey RegionsAnalysis::Key;
 RegionsAnalysis::Result
 RegionsAnalysis::run(Module &M, llvm::ModuleAnalysisManager &MAM) {
   RegionsResult r;
-  r.regions = std::make_unique<Regions>();
-  if (!SmackOptions::NoMemoryRegionSplitting) {
+  r.regions = std::make_unique<Regions>(forceUniversal);
+  if (forceUniversal || SmackOptions::NoMemoryRegionSplitting) {
+    r.regions->runUniversal();
+  } else {
     auto &dsa = MAM.getResult<DSAWrapperAnalysis>(M);
     r.regions->runImpl(M, *dsa.wrapper);
   }
@@ -254,6 +259,31 @@ unsigned Regions::size() const { return regions.size(); }
 Region &Regions::get(unsigned R) { return regions[R]; }
 
 void Regions::snapshotReport(SmackMemoryPartitionReport &report) const {
+  if (universalMode()) {
+    report.partitioner = "universal";
+    report.dsaMode = "disabled";
+    report.regionCount = 1;
+    report.memoryAccessCount = memoryAccessCount;
+    report.mergeCount = 0;
+    report.lateRegionCount = 0;
+    report.svfUniversalRegion = true;
+    report.svfNoAliasSeedCount = 0;
+    report.svfFieldWindows = false;
+    report.svfOffsetKnownCount = 0;
+    report.windowedRegionCount = 0;
+    report.splitComponentCount = 0;
+    report.singletonCount = 0;
+    report.allocatedCount = 1;
+    report.bytewiseCount = regions.front().bytewiseAccess() ? 1 : 0;
+    report.incompleteCount = 1;
+    report.complicatedCount = 1;
+    report.collapsedCount = 1;
+    report.typedCount = 0;
+    report.untypedCount = 1;
+    report.fallbackReasons.clear();
+    report.fallbackReasons.push_back({"universal-map", 1});
+    return;
+  }
   // Region-level diagnostics only. The oracle/SVF-evidence counters that the
   // old sea-dsa+oracle path filled stay at their zero defaults (the feature is
   // gone). This keeps llvm2bpl's --memory-partition-report JSON populated for
@@ -261,8 +291,36 @@ void Regions::snapshotReport(SmackMemoryPartitionReport &report) const {
   report.partitioner = "svf-andersen";
   report.dsaMode = "svf-andersen";
   report.regionCount = regions.size();
+  report.memoryAccessCount = memoryAccessCount;
+  report.mergeCount = mergeCount;
+  report.lateRegionCount = lateRegionCount;
+  if (auto *dsa = Region::getDSA()) {
+    report.svfUniversalRegion = dsa->usedUniversalRegion();
+    report.svfUnresolvedAccessCount = dsa->getUnresolvedAccessCount();
+    report.svfUnknownTargetAccessCount = dsa->getUnknownTargetAccessCount();
+    report.svfUnsupportedPointerOriginCount =
+        dsa->getUnsupportedPointerOriginCount();
+    report.svfScannedFunctionCount = dsa->getScannedFunctionCount();
+    report.svfReachableFunctionCount = dsa->getReachableFunctionCount();
+    report.svfIrSnapshotMatch = dsa->matchedIrSnapshot();
+    report.svfNoAliasSeedCount = dsa->getNoAliasSeedCount();
+    report.svfClosedInputContract = dsa->usedClosedInputContract();
+    report.svfAllocatorModel = dsa->usedAllocatorModel();
+    report.svfFieldWindows = false;
+    report.svfOffsetKnownCount = 0;
+  }
+  report.windowedRegionCount = 0;
+  report.splitComponentCount = 0;
 
   unsigned noRepresentative = 0;
+  DSAWrapper *dsa = Region::getDSA();
+  report.svfNoAliasSeededRegionCount = 0;
+  report.svfStackRegionCount = 0;
+  report.svfHeapRegionCount = 0;
+  report.svfGlobalRegionCount = 0;
+  report.svfMixedAuthorityRegionCount = 0;
+  report.svfRegionAuthorities.clear();
+  unsigned regionIndex = 0;
   for (const auto &region : regions) {
     if (region.isSingleton())
       ++report.singletonCount;
@@ -282,9 +340,39 @@ void Regions::snapshotReport(SmackMemoryPartitionReport &report) const {
       ++report.untypedCount;
     if (!region.hasRepresentative())
       ++noRepresentative;
+    if (dsa && region.hasRepresentative()) {
+      MemNodeRef representative = region.getRepresentative();
+      const bool noAlias = dsa->hasNoAliasSeed(representative);
+      const bool stack = dsa->hasStackAllocation(representative);
+      const bool heap = dsa->hasHeapAllocation(representative);
+      const bool global = dsa->hasGlobalAllocation(representative);
+      report.svfRegionAuthorities.push_back(
+          {regionIndex, noAlias, stack, heap, global});
+      report.svfNoAliasSeededRegionCount += noAlias;
+      report.svfStackRegionCount += stack;
+      report.svfHeapRegionCount += heap;
+      report.svfGlobalRegionCount += global;
+      if (static_cast<unsigned>(noAlias) + static_cast<unsigned>(stack) +
+              static_cast<unsigned>(heap) + static_cast<unsigned>(global) >
+          1)
+        ++report.svfMixedAuthorityRegionCount;
+    }
+    ++regionIndex;
   }
 
   report.fallbackReasons.clear();
+  if (report.svfUnsupportedPointerOriginCount)
+    report.fallbackReasons.push_back(
+        {"unsupported-pointer-origin",
+         report.svfUnsupportedPointerOriginCount});
+  if (report.svfUnresolvedAccessCount)
+    report.fallbackReasons.push_back(
+        {"unresolved-access", report.svfUnresolvedAccessCount});
+  if (report.svfUnknownTargetAccessCount)
+    report.fallbackReasons.push_back(
+        {"blackhole-access", report.svfUnknownTargetAccessCount});
+  if (!report.svfIrSnapshotMatch)
+    report.fallbackReasons.push_back({"ir-snapshot-mismatch", 1});
   if (noRepresentative)
     report.fallbackReasons.push_back({"no-representative", noRepresentative});
   if (report.incompleteCount)
@@ -300,6 +388,8 @@ void Regions::snapshotReport(SmackMemoryPartitionReport &report) const {
 }
 
 unsigned Regions::idx(const Value *V) {
+  if (universalMode())
+    return universalIdx();
   SDEBUG(errs() << "[regions] for: " << *V << "\n"; auto U = V;
          while (U && !isa<Instruction>(U) && !U->use_empty()) U =
              U->user_back();
@@ -313,7 +403,9 @@ unsigned Regions::idx(const Value *V) {
   return idx(R);
 }
 
-unsigned Regions::idx(const Value *V, unsigned length) {
+unsigned Regions::idx(const Value *V, uint64_t length) {
+  if (universalMode())
+    return universalIdx();
   SDEBUG(errs() << "[regions] for: " << *V << " with length " << length << "\n";
          auto U = V; while (U && !isa<Instruction>(U) && !U->use_empty()) U =
                          U->user_back();
@@ -328,6 +420,8 @@ unsigned Regions::idx(const Value *V, unsigned length) {
 }
 
 unsigned Regions::idx(const Value *V, const Type *accessType) {
+  if (universalMode())
+    return universalIdx();
   SDEBUG(errs() << "[regions] for: " << *V << " with access type ";
          if (accessType) accessType->print(errs()); else errs() << "<unknown>";
          errs() << "\n";);
@@ -336,7 +430,9 @@ unsigned Regions::idx(const Value *V, const Type *accessType) {
 }
 
 unsigned Regions::idx(const Value *V, const Type *accessType,
-                      unsigned length) {
+                      uint64_t length) {
+  if (universalMode())
+    return universalIdx();
   SDEBUG(errs() << "[regions] for: " << *V << " with access type ";
          if (accessType) accessType->print(errs()); else errs() << "<unknown>";
          errs() << " and length " << length << "\n";);
@@ -345,18 +441,27 @@ unsigned Regions::idx(const Value *V, const Type *accessType,
 }
 
 unsigned Regions::idx(const LoadInst &I) {
+  if (universalMode())
+    return universalIdx();
   SDEBUG(errs() << "[regions] for load access: " << I << "\n";);
   Region R(I);
   return idx(R);
 }
 
 unsigned Regions::idx(const StoreInst &I) {
+  if (universalMode())
+    return universalIdx();
   SDEBUG(errs() << "[regions] for store access: " << I << "\n";);
   Region R(I);
   return idx(R);
 }
 
 unsigned Regions::idx(Region &R) {
+  ++memoryAccessCount;
+  if (!R.hasRepresentative())
+    llvm::report_fatal_error(
+        "SMACK regions: split-memory query has no SVF component; the "
+        "pre-partition unresolved-access scan missed a translated pointer");
   unsigned r;
 
   SDEBUG(errs() << "[regions]   using region: ");
@@ -380,15 +485,33 @@ unsigned Regions::idx(Region &R) {
     }
   }
 
-  if (r == regions.size())
+  if (r == regions.size()) {
     regions.emplace_back(R);
+    if (initialScanComplete)
+      ++lateRegionCount;
 
-  else {
+  } else {
+    ++mergeCount;
     // Here is the tricky part: in case R was merged with an existing region,
     // we must now also merge any other region which intersects with R.
     unsigned q = r + 1;
     while (q < regions.size()) {
       if (regions[r].overlaps(regions[q])) {
+        ++mergeCount;
+
+        // FROZEN-PARTITION INVARIANT (W4). SmackRep queries idx() lazily
+        // DURING translation, after the initial scan; a cascade here ERASES a
+        // region and shifts every later index, silently retargeting already
+        // emitted `$M.k` references — memory corruption in the model. A
+        // post-scan query may merge INTO one existing region (index-stable)
+        // or append a new one; a cascade means the scan under-covered some
+        // access (a scan-coverage bug) and must fail closed.
+        if (initialScanComplete)
+          llvm::report_fatal_error(
+              "SMACK regions: post-scan region merge cascade — a translation-"
+              "time query window straddles two scanned regions; already-"
+              "emitted $M indexes would be silently retargeted. This is a "
+              "region-scan coverage bug.");
 
         SDEBUG(errs() << "[regions]   found extra overlap at index " << q
                       << ": ");
@@ -426,23 +549,23 @@ void Regions::visitAtomicRMWInst(AtomicRMWInst &I) {
 }
 
 void Regions::visitMemSetInst(MemSetInst &I) {
-  unsigned length;
+  uint64_t length;
 
   if (auto CI = dyn_cast<ConstantInt>(I.getLength()))
     length = CI->getZExtValue();
   else
-    length = std::numeric_limits<unsigned>::max();
+    length = Region::UNBOUNDED;
 
   idx(I.getDest(), length);
 }
 
 void Regions::visitMemTransferInst(MemTransferInst &I) {
-  unsigned length;
+  uint64_t length;
 
   if (auto CI = dyn_cast<ConstantInt>(I.getLength()))
     length = CI->getZExtValue();
   else
-    length = std::numeric_limits<unsigned>::max();
+    length = Region::UNBOUNDED;
 
   // We need to visit the source location otherwise
   // extra merges will happen in the translation phrase,
@@ -454,35 +577,41 @@ void Regions::visitMemTransferInst(MemTransferInst &I) {
 void Regions::visitCallInst(CallInst &I) {
   Function *F = I.getCalledFunction();
   std::string name = F && F->hasName() ? F->getName().str() : "";
+  bool isValue = name.find("__SMACK_value") != std::string::npos;
+  bool isCodeOrInv = name.find(Naming::CODE_PROC) != std::string::npos ||
+                     name.find(Naming::INV_PROC_PREFIX) != std::string::npos ||
+                     name.find(Naming::MOD_PROC) != std::string::npos;
 
-  if (F && F->isDeclaration() && I.getType()->isPointerTy() && name != "malloc")
+  if (F && F->isDeclaration() && I.getType()->isPointerTy() &&
+      name != "malloc" && !isValue && !isCodeOrInv)
     idx(&I);
 
-  if (name.find("__SMACK_values") != std::string::npos) {
-    assert(I.arg_size() == 2 && "Expected two operands.");
-    const Value *P = I.getArgOperand(0);
-    const Value *N = I.getArgOperand(1);
+  // Scan annotation/intrinsic-referenced pointers before translation. This
+  // guarantees every later idx() query sees the already-established component
+  // and cannot introduce an undeclared map.
+  auto coverWhole = [&](const Value *P) {
+    if (!P)
+      return;
+    P = P->stripPointerCasts();
+    if (P->getType()->isPointerTy())
+      idx(P, Region::UNBOUNDED);
+  };
 
-    while (isa<const CastInst>(P))
-      P = dyn_cast<const CastInst>(P)->getOperand(0);
-    assert(P->getType()->isPointerTy() && "Expected pointer argument.");
-
-    if (auto CI = dyn_cast<ConstantInt>(N)) {
-      const unsigned bound = CI->getZExtValue();
-      const DataLayout &DL = I.getModule()->getDataLayout();
-      // Opaque-pointer-safe element type: recover from a load/store access of P
-      // (PointerType::getElementType() is removed under opaque pointers). Fall
-      // back to i8 as Region::init does.
-      const Type *T = accessTypeFromUsers(P);
-      if (!T)
-        T = Type::getInt8Ty(I.getContext());
-      const unsigned size = fixedTypeStoreSize(DL, T);
-      const unsigned length = bound * size;
-      idx(P, T, length);
-
-    } else {
-      llvm_unreachable("Non-constant size expression not yet handled.");
+  if (isValue) {
+    // arg0 (and, for the load-from-field forms, its pointer operand) name the
+    // annotated object; fuse their components.
+    for (const Use &U : I.args()) {
+      const Value *A = U.get();
+      if (A->getType()->isPointerTy()) {
+        coverWhole(A);
+        if (auto *LI = dyn_cast<LoadInst>(A->stripPointerCasts()))
+          coverWhole(LI->getPointerOperand());
+      }
     }
+  } else if (isCodeOrInv) {
+    for (const Use &U : I.args())
+      if (U.get()->getType()->isPointerTy())
+        coverWhole(U.get());
   }
 }
 

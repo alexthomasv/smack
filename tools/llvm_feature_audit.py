@@ -250,7 +250,6 @@ def _run_llvm2bpl(
             str(llvm2bpl),
             f"--entry-points={fixture.entry_point}",
             f"--bpl={bpl_path}",
-            "-smack-memory-partitioner=sea-dsa",
             f"--smack-pipeline-report={report_path}",
             str(linked_bc),
         ],

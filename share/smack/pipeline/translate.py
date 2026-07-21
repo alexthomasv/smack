@@ -5,7 +5,6 @@ The `llvm_to_bpl` driver chains: `llvm2bpl` subprocess → `annotate_bpl` →
 `memsafety_subproperty_selection` → `replace_reach_error` → `transform_bpl`.
 """
 
-import os
 import re
 import sys
 from pathlib import Path
@@ -13,7 +12,7 @@ from pathlib import Path
 from smack.cli.results import VProperty
 from smack.constants import VERSION, inlined_procedures
 from smack.pipeline.transform import transform_bpl
-from smack.utils import temporary_file, try_command
+from smack.utils import try_command
 
 
 def procedure_annotation(name, args):
@@ -96,8 +95,6 @@ def _llvm2bpl_cmd(
     *,
     bpl_file=None,
     ll_file=None,
-    memory_partitioner=None,
-    memory_partition_oracle=None,
     memory_partition_report=None,
     include_devirt_report=True,
     skip_devirt=False,
@@ -106,8 +103,8 @@ def _llvm2bpl_cmd(
     if bpl_file:
         cmd += ["-bpl", bpl_file]
     cmd += ["-warn-type", args.warn]
-    # sea-dsa was replaced by the SVF-Andersen memory partition; its -sea-dsa*
-    # flags are gone. The region partition is now produced unconditionally.
+    # Memory uses the in-process SVF component partition with a fail-closed
+    # universal fallback. There is no partition selector or external oracle.
     if sys.stdout.isatty():
         cmd += ["-colored-warnings"]
     cmd += ["-source-loc-syms"]
@@ -141,10 +138,7 @@ def _llvm2bpl_cmd(
         cmd += ["-rewrite-bitwise-ops"]
     if args.no_memory_splitting:
         cmd += ["-no-memory-splitting"]
-    # Memory partitioning is now SVF-Andersen only — the -smack-memory-partitioner
-    # selector, its external oracle, and all -smack-svf-* tuning flags were removed
-    # with sea-dsa. Devirtualization now runs on SVF's resolved call graph and is
-    # ON by default; -smack-skip-devirt turns it off.
+    # Devirtualization runs on SVF's resolved call graph and is on by default.
     if skip_devirt:
         cmd += ["-smack-skip-devirt"]
     if include_devirt_report and getattr(args, "devirt_report", None):
@@ -173,88 +167,13 @@ def _llvm2bpl_cmd(
     return cmd
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def _resolve_svf_timeout(args) -> int:
-    if getattr(args, "svf_timeout", None) is not None:
-        return int(args.svf_timeout)
-    return int(os.environ.get("SMACK_SVF_TIMEOUT", "300"))
-
-
-def _uses_svf_memory_oracle(partitioner: str) -> bool:
-    return partitioner == "svf-refined"
-
-
-def generate_svf_memory_partition_oracle(args) -> str:
-    pre_ll = temporary_file("svf-pre-bpl", ".ll", args)
-    oracle = temporary_file("svf-memory-partition", ".json", args)
-    pre_cmd = _llvm2bpl_cmd(
-        args,
-        ll_file=pre_ll,
-        memory_partitioner="sea-dsa",
-        include_devirt_report=False,
-        skip_devirt=True,
-    )
-    try_command(pre_cmd, console=True)
-
-    svf_wpa = getattr(args, "svf_wpa", None) or os.environ.get("SMACK_SVF_WPA") or "wpa"
-    svf_extapi = getattr(args, "svf_extapi", None) or os.environ.get("SMACK_SVF_EXTAPI")
-    if not svf_extapi:
-        sys.exit(
-            f"Error: --memory-partitioner {args.memory_partitioner} requires --svf-extapi or "
-            "SMACK_SVF_EXTAPI when --memory-partition-oracle is not provided"
-        )
-    svf_mem_par = (
-        getattr(args, "svf_mem_par", None)
-        or os.environ.get("SMACK_SVF_MEM_PAR")
-        or "intra-disjoint"
-    )
-    adapter = _repo_root() / "tools" / "svf_memory_partition_adapter.py"
-    adapter_cmd = [
-        sys.executable,
-        str(adapter),
-        "--bc",
-        pre_ll,
-        "--out",
-        oracle,
-        "--svf-wpa",
-        str(svf_wpa),
-        "--svf-extapi",
-        str(svf_extapi),
-        "--mem-par",
-        str(svf_mem_par),
-        "--timeout",
-        str(_resolve_svf_timeout(args)),
-    ]
-    adapter_cmd += ["--indirect-call-targets"]
-    if getattr(args, "svf_loop_diagnostics", False):
-        adapter_cmd += ["--loop-diagnostics"]
-    if getattr(args, "svf_saber_diagnostics", False):
-        adapter_cmd += ["--saber-diagnostics"]
-    if getattr(args, "svf_mta_diagnostics", False):
-        adapter_cmd += ["--mta-diagnostics"]
-    try_command(adapter_cmd, console=True)
-    return oracle
-
-
 def llvm_to_bpl(args):
     """Translate the LLVM bitcode file to a Boogie source file."""
-
-    oracle = getattr(args, "memory_partition_oracle", None)
-    if (
-        _uses_svf_memory_oracle(args.memory_partitioner)
-        and not oracle
-        and not args.no_memory_splitting
-    ):
-        oracle = generate_svf_memory_partition_oracle(args)
 
     cmd = _llvm2bpl_cmd(
         args,
         bpl_file=args.bpl_file,
         ll_file=args.ll_file,
-        memory_partition_oracle=oracle,
         memory_partition_report=args.memory_partition_report,
     )
     try_command(cmd, console=True)

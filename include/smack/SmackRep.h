@@ -54,7 +54,7 @@ protected:
   Program *program;
   Regions *regions;
   std::vector<std::string> bplGlobals;
-  std::map<const llvm::Value *, unsigned> globalAllocations;
+  std::map<const llvm::Value *, uint64_t> globalAllocations;
 
   long long globalsOffset;
   long long externsOffset;
@@ -63,6 +63,12 @@ protected:
 
   std::vector<std::string> initFuncs;
   std::map<std::string, Decl *> auxDecls;
+
+  // Bodyless "unknown callee" procedures backing indirect calls devirt could
+  // not resolve (one per return type). SmackModuleGenerator appends
+  // `modifies <every memory map>` to each after translation, so a call havocs
+  // all memory — the same conservative treatment external declarations get.
+  std::map<std::string, ProcDecl *> unknownCallProcs;
 
   // Track GEP-based pointer loads for annotation aliasing.
   // Key: string representation of the GEP address expression.
@@ -83,12 +89,12 @@ public:
   Program *getProgram() { return program; }
 
 private:
-  unsigned storageSize(llvm::Type *T);
-  unsigned offset(llvm::ArrayType *T, unsigned idx);
-  unsigned offset(llvm::StructType *T, unsigned idx);
+  uint64_t storageSize(llvm::Type *T);
+  uint64_t offset(llvm::ArrayType *T, unsigned idx);
+  uint64_t offset(llvm::StructType *T, unsigned idx);
 
-  const Expr *pa(const Expr *base, long long index, unsigned size);
-  const Expr *pa(const Expr *base, const Expr *index, unsigned size);
+  const Expr *pa(const Expr *base, long long index, uint64_t size);
+  const Expr *pa(const Expr *base, const Expr *index, uint64_t size);
   const Expr *pa(const Expr *base, unsigned long long offset);
   const Expr *pa(const Expr *base, const Expr *index, const Expr *size);
   const Expr *pa(const Expr *base, const Expr *offset);
@@ -162,7 +168,8 @@ public:
   const Expr *ptrArith(const llvm::GetElementPtrInst *I);
   const Expr *ptrArith(const llvm::ConstantExpr *CE);
   const Expr *ptrArith(const llvm::Value *p, llvm::Type *sourceElementType,
-                       llvm::ArrayRef<llvm::Value *> indices);
+                       llvm::ArrayRef<llvm::Value *> indices,
+                       bool noUnsignedSignedWrap);
 
   const Expr *expr(const llvm::Value *v, bool isConstIntUnsigned = false,
                    bool isUnsignedInst = false);
@@ -192,6 +199,9 @@ public:
   const Stmt *alloca(llvm::AllocaInst &i);
   const Stmt *memcpy(const llvm::MemCpyInst &msi);
   const Stmt *memset(const llvm::MemSetInst &msi);
+  const Stmt *unknownIndirectCall(const llvm::CallBase &CB);
+  std::list<ProcDecl *> unknownIndirectCallProcs();
+
   const Expr *load(const llvm::Value *P);
   const Expr *load(const llvm::Value *P, const llvm::Type *T);
   const Expr *load(const llvm::LoadInst &I);
@@ -230,7 +240,6 @@ public:
   void addInitFunc(const llvm::Function *f);
   Decl *getInitFuncs();
   const Expr *declareIsExternal(const Expr *e);
-
   bool isContractExpr(const llvm::Value *V) const;
   bool isContractExpr(const std::string S) const;
   Regions* getRegions() const { return regions; }
