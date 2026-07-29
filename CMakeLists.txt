@@ -190,7 +190,11 @@ include(HandleLLVMOptions)
 
 # SVF Andersen supplies both the fail-closed memory partition and indirect-call
 # targets for devirtualization, so it is a hard dependency of this build.
-set(SVF_HOME "/home/ubuntu/SVF" CACHE PATH "SVF source+build root")
+set(SVF_HOME "$ENV{SVF_HOME}" CACHE PATH "SVF source+build root")
+if(NOT SVF_HOME)
+  message(FATAL_ERROR
+    "SVF_HOME must identify the exact SVF source+build root")
+endif()
 find_package(SVF REQUIRED CONFIG)
 # SVF's exported targets advertise build-tree include dirs that may not exist in
 # every layout (e.g. SVF::SvfFlags carries Release-build/include/SVF which is
@@ -218,10 +222,15 @@ target_link_libraries(smackTranslator SVF::SvfLLVM SVF::SvfCore)
 target_link_libraries(llvm2bpl smackTranslator utils)
 target_link_libraries(llvm-diffmatch2bpl smackTranslator utils)
 
-# SVF + its private LLVM-21 and z3 shared libs live outside the system loader
-# path; bake their dirs into the RPATH of the tools that pull them in.
-set(SMACK_SVF_RPATH
-  "/home/ubuntu/SVF/Release-build/lib;/home/ubuntu/SVF/llvm-21.1.0.obj/lib;/home/ubuntu/SVF/z3.obj/bin")
+# SVF + its private LLVM and z3 shared libs can live outside the system loader
+# path. Derive the RPATH from the configured toolchain instead of embedding one
+# developer checkout.
+set(SMACK_SVF_RPATH "${SVF_HOME}/Release-build/lib")
+list(APPEND SMACK_SVF_RPATH ${LLVM_LIBRARY_DIRS})
+if(EXISTS "${SVF_HOME}/z3.obj/bin")
+  list(APPEND SMACK_SVF_RPATH "${SVF_HOME}/z3.obj/bin")
+endif()
+list(REMOVE_DUPLICATES SMACK_SVF_RPATH)
 set_target_properties(llvm2bpl llvm-diffmatch2bpl extern-statics PROPERTIES
   BUILD_RPATH "${SMACK_SVF_RPATH}"
   INSTALL_RPATH "${SMACK_SVF_RPATH}")
@@ -256,7 +265,7 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/share/smack
 )
 
 option(SMACK_BUILD_TESTS "Build SMACK C++ unit tests (requires network for FetchContent)" OFF)
-option(SMACK_NEW_PM "Use NewPM full pipeline in llvm2bpl (opt-in; Tier A+B+C+D via runSmackFullNewPM)" OFF)
+option(SMACK_NEW_PM "Use NewPM full pipeline in llvm2bpl (Tier A+B+C+D via runSmackFullNewPM)" ON)
 if(SMACK_NEW_PM)
   target_compile_definitions(llvm2bpl PRIVATE SMACK_NEW_PM=1)
 endif()
