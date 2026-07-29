@@ -35,6 +35,100 @@ class DiffHunk:
 _HUNK_RE = re.compile(r"^@@\s+-(?P<oa>\d+)(?:,(?P<ob>\d+))?\s+\+(?P<na>\d+)(?:,(?P<nb>\d+))?\s+@@")
 
 
+class PatchApplyError(ValueError):
+    """A unified diff cannot be applied exactly to its declared source."""
+
+
+def apply_unified_diff_to_text(source_text: str, patch_text: str) -> str:
+    """Apply ordered unified-diff hunks without fuzz or an external package."""
+
+    source_lines = source_text.splitlines(keepends=True)
+    source_has_newline = source_text.endswith("\n") or source_text == ""
+    patch_lines = patch_text.splitlines()
+    output: list[str] = []
+    source_index = 0
+    hunk_index = 0
+    trailing_newline_dropped = False
+
+    while hunk_index < len(patch_lines):
+        match = _HUNK_RE.match(patch_lines[hunk_index])
+        if match is None:
+            hunk_index += 1
+            continue
+        old_start = int(match.group("oa"))
+        old_length = int(match.group("ob") or "1")
+        target_index = old_start - 1 if old_length > 0 else old_start
+        target_index = max(target_index, 0)
+        if target_index < source_index or target_index > len(source_lines):
+            raise PatchApplyError(f"hunk at -{old_start} is outside source order")
+        output.extend(source_lines[source_index:target_index])
+        source_index = target_index
+        consumed = 0
+        last_emitted: int | None = None
+        hunk_index += 1
+        while hunk_index < len(patch_lines):
+            body = patch_lines[hunk_index]
+            if _HUNK_RE.match(body) or body.startswith(("--- ", "+++ ")):
+                break
+            hunk_index += 1
+            if body.startswith("\\"):
+                if last_emitted is not None and output[last_emitted].endswith("\n"):
+                    output[last_emitted] = output[last_emitted][:-1]
+                    trailing_newline_dropped = True
+                continue
+            if body == "" or body.startswith(" "):
+                expected = body[1:] if body.startswith(" ") else ""
+                if source_index >= len(source_lines):
+                    raise PatchApplyError(f"hunk at -{old_start}: context past EOF")
+                actual = source_lines[source_index].rstrip("\r\n")
+                if actual != expected:
+                    raise PatchApplyError(
+                        f"hunk at -{old_start}: expected context {expected!r}, "
+                        f"got {actual!r}"
+                    )
+                output.append(source_lines[source_index])
+                last_emitted = len(output) - 1
+                source_index += 1
+                consumed += 1
+                continue
+            if body.startswith("-"):
+                expected = body[1:]
+                if source_index >= len(source_lines):
+                    raise PatchApplyError(f"hunk at -{old_start}: delete past EOF")
+                actual = source_lines[source_index].rstrip("\r\n")
+                if actual != expected:
+                    raise PatchApplyError(
+                        f"hunk at -{old_start}: expected delete {expected!r}, "
+                        f"got {actual!r}"
+                    )
+                source_index += 1
+                consumed += 1
+                last_emitted = None
+                continue
+            if body.startswith("+"):
+                output.append(body[1:] + "\n")
+                last_emitted = len(output) - 1
+                continue
+            raise PatchApplyError(
+                f"hunk at -{old_start}: unrecognised body line {body!r}"
+            )
+        if consumed != old_length:
+            raise PatchApplyError(
+                f"hunk at -{old_start}: consumed {consumed} of "
+                f"{old_length} source lines"
+            )
+
+    output.extend(source_lines[source_index:])
+    result = "".join(output)
+    if (
+        not source_has_newline
+        and not trailing_newline_dropped
+        and result.endswith("\n")
+    ):
+        result = result[:-1]
+    return result
+
+
 def parse_unified_diff(text: str) -> list[DiffHunk]:
     """Parse git-style unified diff hunks into source line regions."""
 

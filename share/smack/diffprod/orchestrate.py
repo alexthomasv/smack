@@ -55,7 +55,7 @@ def run_diff_product(args):
                 diff_text = f.read()
 
         if mode == "patch":
-            from tools.smack_diff import apply_unified_diff_to_text
+            from smack.diffprod.diff import apply_unified_diff_to_text
 
             with Path(args.diff_left).open() as f:
                 left_source_text = f.read()

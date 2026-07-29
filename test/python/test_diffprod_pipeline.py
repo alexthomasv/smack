@@ -7,7 +7,11 @@ import shutil
 import subprocess
 
 import pytest
-from smack.diffprod.diff import parse_unified_diff
+from smack.diffprod.diff import (
+    PatchApplyError,
+    apply_unified_diff_to_text,
+    parse_unified_diff,
+)
 from smack.diffprod.pipeline import build_from_bpl
 from smack.diffprod.provenance import parse_boogie_with_provenance
 from smack_test_paths import diff_product_cli, run_with_timeout, tool_path_env
@@ -242,6 +246,23 @@ def test_parse_unified_diff_hunks():
     assert len(hunks) == 1
     assert hunks[0].old_path == "demo.c"
     assert hunks[0].new_start == 2
+
+
+def test_apply_unified_diff_is_self_contained_and_exact():
+    source = "int f(void) {\n  return 1;\n}\n"
+    patch = (
+        "--- a/demo.c\n"
+        "+++ b/demo.c\n"
+        "@@ -1,3 +1,3 @@\n"
+        " int f(void) {\n"
+        "-  return 1;\n"
+        "+  return 2;\n"
+        " }\n"
+    )
+
+    assert apply_unified_diff_to_text(source, patch) == source.replace("1", "2")
+    with pytest.raises(PatchApplyError, match="expected delete"):
+        apply_unified_diff_to_text(source.replace("1", "3"), patch)
 
 
 def test_parse_unified_diff_edge_hunks():
